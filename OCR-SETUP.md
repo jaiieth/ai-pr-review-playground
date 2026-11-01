@@ -113,7 +113,7 @@ PR-Agent ถูกถอดออกแล้ว (`pr-agent.yml`, `.pr_agent.tom
 - 17:18 เปิด PR 3 commit → comment สรุปทั้ง PR (marker `2772caa`) 0:48
 - 17:20 push 2 commit → comment ใหม่ `🔄 อัปเดต PR (OpenCode): 2772caa..e457fb7` รายการ 2 commit + สรุปเฉพาะ 2 commit นั้น 0:36
 - 17:22 push 1 commit → comment ใหม่ `e457fb7..c301ac9` (ต่อจาก marker ของ comment อัปเดตก่อนหน้า) 0:31
-- comment สรุปแรกไม่ถูกแก้ (updated_at เท่าเดิม) / OCR รอบ `e457fb7` ถูก cancel เพราะ push ใหม่มาระหว่างรัน (concurrency ต่อ PR) แล้วรอบ `c301ac9` รีวิวต่อจาก checkpoint
+- comment สรุปแรกไม่ถูกแก้ (updated_at เท่าเดิม) / OCR รอบ `e457fb7` ถูก cancel เพราะ push ใหม่มาระหว่างรัน (concurrency ต่อ PR) แล้วรอบ `c301ac9` รีวิว checkpoint `2772caa..c301ac9` (รวม commit ของ push ที่ถูก cancel) 2:15
 
 หมายเหตุ: PR ที่เปิดไว้ก่อนแก้ workflow จะใช้ไฟล์ workflow จาก merge ref เดิมจนกว่าจะมี push ใหม่ (playground: #9 ติด label ครั้งแรกแล้ว trigger ใหม่ของ OpenCode ยังไม่ทำงาน)
 
