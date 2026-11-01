@@ -2,15 +2,16 @@ name: OpenCode PR Summary
 
 # Summary only (no review findings, no inline comments): when a PR has no real description,
 # OpenCode writes a short Thai summary (what the PR is about, main changes, risk areas) and posts
-# it as ONE sticky PR comment. The PR body is never edited. OCR (ocr-review.yml) is the reviewer.
+# it as a PR comment. The PR body is never edited. OCR (ocr-review.yml) is the reviewer.
 # Every trigger goes through the same gates (checked in the first step, against the live PR):
 #   body has < OPENCODE_SUMMARY_MIN_CHARS meaningful chars, diff not empty (changed_files > 0),
 #   the summary (if any) does not cover the current head SHA yet, OPENCODE_GO_API_KEY available.
-# First summary = whole PR (base...head). Later pushes do NOT regenerate it: an update section
-# for only the new commits is appended to the same comment. The comment keeps the last summarized
-# SHA in a hidden marker; the range is event.before..head when before == that SHA, otherwise
-# (force-push, label re-add, ready) last-SHA..head; if last-SHA is no longer an ancestor of head
-# (rewritten history) or the comment is near GitHub's size limit, the whole summary is regenerated.
+# First summary = whole PR (base...head), its own comment. Each later push gets a SEPARATE
+# "อัปเดต PR (OpenCode): <from7>..<to7>" comment for only that push's commits. Every comment keeps
+# the SHA it covers in a hidden marker; the newest one is the last summarized SHA. Range is
+# event.before..head when before == that SHA, otherwise (cancelled run, label re-add, ready)
+# last-SHA..head; if last-SHA is no longer an ancestor of head (force-push / rebase) the whole-PR
+# summary comment is regenerated in place.
 # Commits merged in from the base branch are left out of updates (first-parent, no merges).
 # Triggers:
 #   opened / reopened / ready_for_review / synchronize -> non-draft PRs, head branch not in the
@@ -66,7 +67,8 @@ jobs:
     env:
       OPENCODE_VERSION: "1.19.5"
       MODEL: ${{ vars.OPENCODE_MODEL || 'opencode-go/deepseek-v4.1-flash' }}
-      MARKER: "<!-- opencode-pr-summary -->"
+      MARKER: "<!-- opencode-pr-summary -->"          # whole-PR summary comment (one per PR)
+      UPDATE_MARKER: "<!-- opencode-pr-update -->"    # one comment per push update
     steps:
       - name: Check description
         id: gate
@@ -92,6 +94,14 @@ jobs:
                   'Accept': 'application/vnd.github+json'})
               with urllib.request.urlopen(req, timeout=30) as r:
                   return json.load(r)
+          def get_all(url):
+              out, page = [], 1
+              while True:
+                  batch = get(f"{url}?per_page=100&page={page}")
+                  out += batch
+                  if len(batch) < 100:
+                      return out
+                  page += 1
 
           def meaningful(body):
               body = re.sub(r'<!--.*?-->', '', body or '', flags=re.S)
@@ -120,15 +130,19 @@ jobs:
           elif os.environ['HAS_KEY'] != 'true':
               reason = 'OPENCODE_GO_API_KEY is not available (fork PR, or Dependabot without a Dependabot secret)'
           else:
-              comments = get(f"{api}/issues/{pr_number}/comments?per_page=100")
-              mine = [c for c in comments if os.environ['MARKER'] in (c.get('body') or '')
-                      and c.get('user', {}).get('login') == 'github-actions[bot]']
-              if mine:
-                  m = re.search(r'<!-- opencode-pr-summary-sha: ([0-9a-f]{40}) -->', mine[0]['body'])
-                  last = m.group(1) if m else ''
+              # Last summarized SHA = sha tag of the most recently written summary/update comment.
+              tagged = []
+              for c in get_all(f"{api}/issues/{pr_number}/comments"):
+                  b = c.get('body') or ''
+                  m = re.search(r'<!-- opencode-pr-summary-sha: ([0-9a-f]{40}) -->', b)
+                  if (m and c.get('user', {}).get('login') == 'github-actions[bot]'
+                          and (os.environ['MARKER'] in b or os.environ['UPDATE_MARKER'] in b)):
+                      tagged.append((c['updated_at'], c['id'], m.group(1)))
+              if tagged:
+                  last = max(tagged)[2]
                   if last == pr['head']['sha']:
                       reason = 'summary already covers this head SHA'
-                  elif last and len(mine[0]['body']) < 55000:
+                  else:
                       mode = 'update'
                       before = os.environ.get('EVENT_BEFORE') or ''
                       from_sha = before if before == last else last
@@ -251,7 +265,7 @@ jobs:
             > "$RUNNER_TEMP/opencode-output.txt"
           echo "output: $(wc -c < "$RUNNER_TEMP/opencode-output.txt") bytes"
 
-      - name: Post sticky summary comment
+      - name: Post summary / update comment
         if: steps.gate.outputs.run == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -287,31 +301,46 @@ jobs:
               with urllib.request.urlopen(req, timeout=30) as r:
                   return json.load(r)
 
-          comments = call('GET', f"{api}/issues/{os.environ['PR_NUMBER']}/comments?per_page=100")
-          mine = [c for c in comments if marker in (c.get('body') or '')
-                  and c.get('user', {}).get('login') == 'github-actions[bot]']
+          def get_all(url):
+              out, page = [], 1
+              while True:
+                  batch = call('GET', f"{url}?per_page=100&page={page}")
+                  out += batch
+                  if len(batch) < 100:
+                      return out
+                  page += 1
+
+          pr_api = f"{api}/issues/{os.environ['PR_NUMBER']}/comments"
           tag_re = r'<!-- opencode-pr-summary-sha: [0-9a-f]{40} -->'
-          if mode in ('update', 'marker'):
-              if not mine or not re.search(tag_re, mine[0]['body']):
-                  print('::error::summary comment disappeared; re-run to regenerate')
-                  sys.exit(1)
-              old = re.sub(tag_re, sha_tag, mine[0]['body']).rstrip()
-              if mode == 'marker':
-                  body = old + '\n'
-              else:
-                  commits = open(os.path.join(tmp, 'commits.md'), encoding='utf-8').read().strip()
-                  n = len(commits.splitlines())
-                  body = (f"{old}\n\n---\n### 🔄 อัปเดต `{os.environ['FROM_SHA'][:7]}..{head[:7]}` ({n} commit)\n"
-                          f"{commits}\n\n{text}\n")
+          bot = [c for c in get_all(pr_api) if c.get('user', {}).get('login') == 'github-actions[bot]'
+                 and re.search(tag_re, c.get('body') or '')]
+          summary = [c for c in bot if marker in c['body']]
+          ours = [c for c in bot if marker in c['body'] or os.environ['UPDATE_MARKER'] in c['body']]
+          frm = os.environ['FROM_SHA'][:7]
+          if mode == 'marker':
+              # Base merge only: no new own commits; move the last-summarized SHA forward in place.
+              latest = max(ours, key=lambda c: (c['updated_at'], c['id']))
+              c = call('PATCH', f"{api}/issues/comments/{latest['id']}",
+                       {'body': re.sub(tag_re, sha_tag, latest['body'])})
+              print(f"marker: moved last-summarized SHA to {head[:7]} on {c['html_url']}")
+          elif mode == 'update':
+              commits = open(os.path.join(tmp, 'commits.md'), encoding='utf-8').read().strip()
+              n = len(commits.splitlines())
+              body = (f"{os.environ['UPDATE_MARKER']}\n{sha_tag}\n"
+                      f"## 🔄 อัปเดต PR (OpenCode): `{frm}..{head[:7]}`\n"
+                      f"> สรุปเฉพาะ {n} commit ใน push นี้ (สรุปทั้ง PR อยู่ใน comment แรกของ OpenCode) "
+                      f"หยุดอัปเดตเมื่อเขียน description แล้ว\n\n{commits}\n\n{text}\n")
+              c = call('POST', pr_api, {'body': body})
+              print(f"update: posted update comment {c['html_url']}")
           else:
               body = (f"{marker}\n{sha_tag}\n## 📝 สรุป PR อัตโนมัติ (OpenCode)\n"
                       f"> PR นี้ยังไม่มี description จึงสรุปจาก diff ทั้ง PR "
                       f"`{os.environ['BASE_SHA'][:7]}...{head[:7]}` (สรุปอย่างเดียว ไม่ใช่การรีวิว) "
-                      f"commit ที่ push เพิ่มจะถูกสรุปต่อท้ายเป็นส่วน \"อัปเดต\" "
-                      f"และ comment นี้จะหยุดอัปเดตเมื่อเขียน description แล้ว\n\n{text}\n")
-          if mine:
-              c = call('PATCH', f"{api}/issues/comments/{mine[0]['id']}", {'body': body})
-              print(f"{mode}: updated summary comment {c['html_url']}")
-          else:
-              c = call('POST', f"{api}/issues/{os.environ['PR_NUMBER']}/comments", {'body': body})
-              print(f"{mode}: posted summary comment {c['html_url']}")
+                      f"push ต่อไปจะได้ comment \"อัปเดต PR\" แยกต่อ push "
+                      f"และจะหยุดอัปเดตเมื่อเขียน description แล้ว\n\n{text}\n")
+              if summary:   # history rewritten: regenerate the whole-PR summary in place
+                  c = call('PATCH', f"{api}/issues/comments/{summary[0]['id']}", {'body': body})
+                  print(f"full: regenerated summary comment {c['html_url']}")
+              else:
+                  c = call('POST', pr_api, {'body': body})
+                  print(f"full: posted summary comment {c['html_url']}")
