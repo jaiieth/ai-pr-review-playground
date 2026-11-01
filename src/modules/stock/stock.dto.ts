@@ -1,5 +1,7 @@
+import { IsInt, IsNotEmpty, IsString } from 'class-validator';
+
 export class StockMoveDto {
-  itemCode!: string;
-  warehouseCode!: string;
-  qty!: number;
+  @IsString() @IsNotEmpty() itemCode!: string;
+  @IsString() @IsNotEmpty() warehouseCode!: string;
+  @IsInt() qty!: number;
 }
