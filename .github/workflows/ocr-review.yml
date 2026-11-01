@@ -1,22 +1,36 @@
 name: OCR Review
 
-# Alibaba open-code-review (OCR) v1.13.3 via the OpenCode Go subscription.
+# The only automatic reviewer: Alibaba open-code-review (OCR) v1.13.3 via the OpenCode Go subscription.
 # Required secret: OPENCODE_GO_API_KEY (oc_sk_... from the Go-subscribed workspace).
 # Optional repo variables (Settings > Secrets and variables > Actions > Variables):
-#   OCR_MODEL     default deepseek-v4.1-flash   (supported: deepseek-*, glm-5.3-flash)
-#   OCR_PROTOCOL  default openai                (openai | anthropic)
-#   OCR_THINKING  default off                   (off | on)
+#   OCR_MODEL              default deepseek-v4.1-flash   (supported: deepseek-*, glm-5.3-flash)
+#   OCR_PROTOCOL           default anthropic             (anthropic | openai)
+#   OCR_THINKING           default on                    (on | off; anthropic on = budget_tokens 8000)
+#   OCR_REVIEW_DRAFTS      default false                 (true = also review draft PRs on open/push)
+#   OCR_TRIGGER_LABEL      default ai-review             (adding it reviews the PR now, draft or not;
+#                                                         a draft carrying it is reviewed on every push)
+#   AI_SKIP_HEAD_BRANCHES  default main,develop          (comma list, no spaces; head branches never
+#                                                         reviewed = release/sync PRs; shared with opencode.yml)
+#   AI_SKIP_HEAD_PREFIX    default release/              (head branches starting with it are skipped;
+#                                                         set to - to disable; shared with opencode.yml)
+# Each push reviews only the commits since the last completed review (checkpoint_range) and never
+# re-posts a comment on lines that already have one (incremental). A newer push cancels a running review.
 # Review rules / ignore paths: .opencodereview/rule.json (OCR's project rule layer).
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review, synchronize]
+    types: [opened, reopened, ready_for_review, synchronize, labeled]
   workflow_dispatch:
     inputs:
       pr_number:
-        description: PR number to review
+        description: PR number to review (drafts included)
         required: true
         type: string
+      full_review:
+        description: Review the whole PR from the merge-base (ignore the last checkpoint)
+        required: false
+        type: boolean
+        default: false
       model:
         description: Model override (empty = repo var OCR_MODEL)
         required: false
@@ -26,13 +40,13 @@ on:
         description: Protocol override
         required: false
         type: choice
-        options: [repo-var, openai, anthropic]
+        options: [repo-var, anthropic, openai]
         default: repo-var
       thinking:
         description: Thinking override
         required: false
         type: choice
-        options: [repo-var, 'off', 'on']
+        options: [repo-var, 'on', 'off']
         default: repo-var
 
 permissions: {}
@@ -40,16 +54,25 @@ permissions: {}
 jobs:
   ocr-review:
     # Bot/agent PRs ARE reviewed (no actor/sender filter).
-    # Skips (pull_request only): drafts (reviewed on ready_for_review) and main <-> develop sync PRs.
+    # pull_request skips (job never starts = 0 billable minutes):
+    #   - "labeled" events for any label other than OCR_TRIGGER_LABEL
+    #   - head branch in AI_SKIP_HEAD_BRANCHES or starting with AI_SKIP_HEAD_PREFIX (release / sync PRs).
+    #     Task PRs branch-x -> main ARE reviewed.
+    #   - drafts, unless OCR_REVIEW_DRAFTS == 'true' or the PR carries OCR_TRIGGER_LABEL
     # workflow_dispatch always runs for the given PR number.
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (!github.event.pull_request.draft &&
-       !((github.event.pull_request.head.ref == 'main' && github.event.pull_request.base.ref == 'develop') ||
-         (github.event.pull_request.head.ref == 'develop' && github.event.pull_request.base.ref == 'main')))
+      (github.event_name == 'pull_request' &&
+       (github.event.action != 'labeled' || github.event.label.name == (vars.OCR_TRIGGER_LABEL || 'ai-review')) &&
+       !contains(format(',{0},', vars.AI_SKIP_HEAD_BRANCHES || 'main,develop'), format(',{0},', github.head_ref)) &&
+       !(vars.AI_SKIP_HEAD_PREFIX != '-' && startsWith(github.head_ref, vars.AI_SKIP_HEAD_PREFIX || 'release/')) &&
+       (!github.event.pull_request.draft || vars.OCR_REVIEW_DRAFTS == 'true' ||
+        contains(github.event.pull_request.labels.*.name, vars.OCR_TRIGGER_LABEL || 'ai-review')))
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Job-level so skipped runs never enter (or cancel) the group.
+    # One review per PR at a time; a newer push cancels the running review (the next run reviews
+    # from the last recorded checkpoint, so cancelled work is picked up). Job-level so skipped
+    # runs (other labels, drafts) never enter or cancel the group.
     concurrency:
       group: ocr-review-${{ github.event.pull_request.number || inputs.pr_number }}
       cancel-in-progress: true
@@ -106,8 +129,8 @@ jobs:
             else echo "$def"; fi
           }
           MODEL="$(pick "$IN_MODEL" "$VAR_MODEL" deepseek-v4.1-flash | tr '[:upper:]' '[:lower:]')"
-          PROTOCOL="$(pick "$IN_PROTOCOL" "$VAR_PROTOCOL" openai | tr '[:upper:]' '[:lower:]')"
-          THINKING="$(pick "$IN_THINKING" "$VAR_THINKING" off | tr '[:upper:]' '[:lower:]')"
+          PROTOCOL="$(pick "$IN_PROTOCOL" "$VAR_PROTOCOL" anthropic | tr '[:upper:]' '[:lower:]')"
+          THINKING="$(pick "$IN_THINKING" "$VAR_THINKING" on | tr '[:upper:]' '[:lower:]')"
 
           if [[ ! "$MODEL" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
             echo "::error::Invalid model id '$MODEL'"; exit 1
@@ -132,10 +155,6 @@ jobs:
                   EXTRA_BODY='{"thinking":{"type":"disabled"}}'; EFFORT='' ;;
                 deepseek-*:on|glm-5.3-flash:on)
                   EXTRA_BODY='{"thinking":{"type":"enabled"}}'; EFFORT=low ;;
-                # PLAYGROUND ONLY (public synthetic repo): muse trains on request data.
-                # Never add this to a real repo. Benchmarked OK on openai with an empty extra body.
-                muse-spark-1.3-contributor:*)
-                  EXTRA_BODY='{}'; EFFORT='' ;;
                 *)
                   echo "::error::Unsupported model '$MODEL' (thinking=$THINKING) on openai. Supported: deepseek-*, glm-5.3-flash"; exit 1 ;;
               esac
@@ -190,3 +209,11 @@ jobs:
           base_ref: ${{ steps.pr.outputs.base_ref }}
           head_sha: ${{ steps.pr.outputs.head_sha }}
           upload_artifacts: 'true'
+          # Sticky summary comment (updated in place) + cross-push checkpoint: each push reviews
+          # only <last reviewed head>..<new head>; falls back to a full review when unsure
+          # (base moved, force-push, config changed). incremental: skip inline comments whose
+          # lines already have one from an earlier run (history is never deleted).
+          sticky_summary: 'true'
+          checkpoint_range: 'true'
+          incremental: 'true'
+          full_review: ${{ inputs.full_review && 'true' || 'false' }}

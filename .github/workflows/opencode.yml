@@ -1,70 +1,106 @@
-name: OpenCode Review
+name: OpenCode PR Summary
 
-# Third reviewer, runs in parallel with ocr-review.yml and pr-agent.yml.
-# - Auto: one Thai PR review with INLINE comments when a PR is opened / reopened / marked ready.
-#   OpenCode CLI (read-only: no edits, bash limited to git diff/show/log) returns JSON findings;
-#   .github/scripts/opencode_inline_review.py checks each line against the diff and posts one
-#   review. Findings outside the diff go into the review body. Not on every push: use `/oc`.
-# - On demand: comment `/oc ...` or `/opencode ...` on a PR (or on a diff line).
-# Docs: https://opencode.ai/docs/github/
+# Summary only (no review findings, no inline comments): when a PR has no real description,
+# OpenCode writes a short Thai summary (what the PR is about, main changes, risk areas) and posts
+# it as ONE sticky PR comment (updated in place). The PR body is never edited.
+# OCR (ocr-review.yml) is the reviewer.
+# Runs on: opened / reopened / ready_for_review, edited (only when the body changed, e.g. cleared),
+# and synchronize only while the body is empty and no summary exists yet (e.g. the PR was opened
+# with an empty first commit). Skipped at job level (0 minutes) for: drafts, PRs with no changed
+# files, release/sync head branches. PRs whose body has >= OPENCODE_SUMMARY_MIN_CHARS meaningful
+# characters stop at the first step on a 1-vCPU runner (1 minute at the slim rate).
+# Required secret: OPENCODE_GO_API_KEY. Optional repo variables:
+#   OPENCODE_MODEL            default opencode-go/deepseek-v4.1-flash
+#   OPENCODE_SUMMARY_MIN_CHARS default 30  (non-space characters left after removing HTML comments,
+#                                           headings, checklist items and empty bullets)
+#   OPENCODE_SUMMARY_DRAFTS   default false (true = also summarize drafts)
+#   AI_SKIP_HEAD_BRANCHES     default main,develop  (shared with ocr-review.yml)
+#   AI_SKIP_HEAD_PREFIX       default release/      (shared with ocr-review.yml; - disables)
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review]
-  issue_comment:
-    types: [created]
-  pull_request_review_comment:
-    types: [created]
+    types: [opened, reopened, ready_for_review, edited, synchronize]
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
-  opencode:
-    # Bot/agent PRs ARE reviewed (no sender/author filter on pull_request).
-    # Skips: draft PRs, main <-> develop sync PRs, comments on plain issues,
-    #        comments written by bots, and commands from people without write access.
-    # Loop safety: replies are posted with GITHUB_TOKEN (github-actions[bot]); GitHub never
-    # starts workflows from GITHUB_TOKEN events, and bot comments are filtered here too.
+  summary:
     if: >
-      (github.event_name == 'pull_request' &&
-        !github.event.pull_request.draft &&
-        !((github.event.pull_request.head.ref == 'main' && github.event.pull_request.base.ref == 'develop') ||
-          (github.event.pull_request.head.ref == 'develop' && github.event.pull_request.base.ref == 'main')))
-      ||
-      ((github.event_name == 'pull_request_review_comment' ||
-        (github.event_name == 'issue_comment' && github.event.issue.pull_request)) &&
-        (contains(github.event.comment.body, '/oc') || contains(github.event.comment.body, '/opencode')) &&
-        github.event.comment.user.type != 'Bot' &&
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # Own group per PR; auto runs and /oc commands don't cancel each other.
+      github.event.pull_request.changed_files > 0 &&
+      (github.event.action != 'edited' || github.event.changes.body != null) &&
+      (github.event.action != 'synchronize' || !github.event.pull_request.body) &&
+      !contains(format(',{0},', vars.AI_SKIP_HEAD_BRANCHES || 'main,develop'), format(',{0},', github.head_ref)) &&
+      !(vars.AI_SKIP_HEAD_PREFIX != '-' && startsWith(github.head_ref, vars.AI_SKIP_HEAD_PREFIX || 'release/')) &&
+      (!github.event.pull_request.draft || vars.OPENCODE_SUMMARY_DRAFTS == 'true')
+    # API-bound work only: the 1-vCPU runner (15-minute job limit) bills at the slim rate.
+    runs-on: ubuntu-slim
+    timeout-minutes: 12
     concurrency:
-      group: opencode-${{ github.event_name == 'pull_request' && 'auto' || 'cmd' }}-${{ github.event.pull_request.number || github.event.issue.number }}
-      cancel-in-progress: false
-    # Review-only: no contents:write, so OpenCode cannot push commits or open PRs.
-    # pull-requests:write is needed to create the review with inline comments.
+      group: opencode-summary-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     permissions:
       contents: read
-      pull-requests: write
-      issues: write
+      pull-requests: write   # create / update the sticky summary comment
     env:
       OPENCODE_VERSION: "1.19.5"
       MODEL: ${{ vars.OPENCODE_MODEL || 'opencode-go/deepseek-v4.1-flash' }}
+      MARKER: "<!-- opencode-pr-summary -->"
     steps:
+      - name: Check description
+        id: gate
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+          ACTION: ${{ github.event.action }}
+          MIN_CHARS: ${{ vars.OPENCODE_SUMMARY_MIN_CHARS || '30' }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: python3 {0}
+        run: |
+          import json, os, re, urllib.request
+
+          def meaningful(body):
+              body = re.sub(r'<!--.*?-->', '', body or '', flags=re.S)
+              keep = []
+              for line in body.splitlines():
+                  n = re.sub(r'\s+', ' ', re.sub(r'\[[xX ]\]', '[ ]', line.strip()))
+                  if not n or re.match(r'^#{1,6}\s', n) or re.match(r'^[-*+]\s*\[ \]', n):
+                      continue  # empty line, heading, checklist item (template)
+                  if re.fullmatch(r'[-*+>|_=`~.:\s]*', n):
+                      continue  # empty bullet / rule
+                  keep.append(re.sub(r'^[-*+>]\s*', '', n))
+              return ''.join(''.join(keep).split())
+
+          chars = len(meaningful(os.environ.get('BODY')))
+          run = chars < int(os.environ['MIN_CHARS'])
+          print(f"description: {chars} meaningful chars (threshold {os.environ['MIN_CHARS']})")
+          if run and os.environ['ACTION'] == 'synchronize':
+              url = (f"https://api.github.com/repos/{os.environ['REPO']}/issues/"
+                     f"{os.environ['PR_NUMBER']}/comments?per_page=100")
+              req = urllib.request.Request(url, headers={
+                  'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  comments = json.load(r)
+              if any(os.environ['MARKER'] in (c.get('body') or '') for c in comments):
+                  print('summary already posted; push does not regenerate it')
+                  run = False
+          print('summarize' if run else 'skip')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"run={'true' if run else 'false'}\n")
+
       - name: Checkout
+        if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Auto review: PR head, so line numbers match the PR diff (default is the merge commit).
-          ref: ${{ github.event.pull_request.head.sha || '' }}
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      # Own install instead of anomalyco/opencode/github: its first step calls the GitHub API
-      # unauthenticated for the latest version and fails the job when the runner IP is rate
-      # limited (seen on PR #5). A pinned version downloads straight from the release assets.
+      # Own pinned install (the upstream installer action calls the GitHub API unauthenticated
+      # for the latest version and fails when the runner IP is rate limited).
       - name: Cache opencode
+        if: steps.gate.outputs.run == 'true'
         id: cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -72,53 +108,52 @@ jobs:
           key: opencode-${{ runner.os }}-${{ runner.arch }}-${{ env.OPENCODE_VERSION }}
 
       - name: Install opencode
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.gate.outputs.run == 'true' && steps.cache.outputs.cache-hit != 'true'
         run: curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
 
-      - name: Add opencode to PATH
-        run: echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-
-      # ---------- Auto review (pull_request): JSON findings -> inline PR review ----------
       - name: Prepare diff and prompt
-        if: github.event_name == 'pull_request'
+        if: steps.gate.outputs.run == 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          MAX_DIFF_BYTES: "400000"
         run: |
-          git diff --no-color "$BASE_SHA"...HEAD > "$RUNNER_TEMP/pr.diff"
-          RANGES=$(python3 .github/scripts/opencode_inline_review.py ranges "$RUNNER_TEMP/pr.diff")
-          cat > "$RUNNER_TEMP/prompt.md" <<PROMPT
-          รีวิว Pull Request #${PR_NUMBER} ในฐานะ senior reviewer ของ ERP API (NestJS + Prisma + PostgreSQL) เขียน title/body/summary เป็นภาษาไทย (ศัพท์เทคนิค/ชื่อโค้ดใช้อังกฤษได้)
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          git diff --no-color --stat=200 "$BASE_SHA"...HEAD > "$RUNNER_TEMP/stat.txt"
+          git diff --no-color "$BASE_SHA"...HEAD > "$RUNNER_TEMP/full.diff"
+          head -c "$MAX_DIFF_BYTES" "$RUNNER_TEMP/full.diff" > "$RUNNER_TEMP/pr.diff"
+          NOTE=""
+          if [ "$(wc -c < "$RUNNER_TEMP/full.diff")" -gt "$MAX_DIFF_BYTES" ]; then
+            NOTE="(diff ยาวเกิน แนบมาแค่ส่วนแรก ดูไฟล์ที่เหลือได้ด้วย git diff ${BASE_SHA}...HEAD -- <path>)"
+          fi
+          {
+            echo "สรุป Pull Request #${PR_NUMBER} \"${PR_TITLE}\" เป็นภาษาไทย (ศัพท์เทคนิค ชื่อไฟล์ และชื่อโค้ดใช้ภาษาอังกฤษได้) สำหรับคนที่จะมา review"
+            echo "PR นี้ไม่มี description ให้อ่านจาก diff ที่แนบมา (เทียบ ${BASE_SHA}...HEAD) ${NOTE}"
+            echo "ใช้ git diff / git show / git log หรืออ่านไฟล์ได้ ห้ามแก้ไฟล์"
+            echo
+            echo "ไฟล์ที่เปลี่ยน:"
+            cat "$RUNNER_TEMP/stat.txt"
+            echo
+            echo "หน้าที่: สรุปเท่านั้น ไม่ต้องรีวิว ไม่ต้องหาบั๊ก ไม่ต้องเสนอวิธีแก้ (มีเครื่องมือรีวิวแยกต่างหาก)"
+            echo "เขียนเป็น Markdown สั้น กระชับ ไม่เกินประมาณ 25 บรรทัด มี 3 หัวข้อนี้ตามลำดับ:"
+            echo "### PR นี้เกี่ยวกับอะไร"
+            echo "1-3 ประโยค บอกจุดประสงค์ของงาน (module/เอกสาร/endpoint ที่เกี่ยวข้อง)"
+            echo "### การเปลี่ยนแปลงหลัก"
+            echo "bullet 3-8 ข้อ จัดกลุ่มตาม module หรือไฟล์ ระบุ endpoint, schema/migration, config ที่เพิ่มหรือเปลี่ยน"
+            echo "### จุดที่ reviewer ควรดูเป็นพิเศษ"
+            echo "bullet 1-5 ข้อ ว่าส่วนไหนเสี่ยงหรือกระทบวงกว้าง (เช่น schema/migration, transaction, เงิน/วันที่, สิทธิ์, การเปลี่ยน API ที่มีคนเรียกอยู่) บอกแค่ว่าควรดูตรงไหนเพราะอะไร ไม่ต้องตัดสินว่าผิด"
+            echo
+            echo "ตอบกลับด้วยสรุปเท่านั้น ระหว่าง marker ด้านล่าง (ไม่มีข้อความอื่นนอก marker):"
+            echo "<<<SUMMARY"
+            echo "...markdown..."
+            echo "SUMMARY>>>"
+          } > "$RUNNER_TEMP/prompt.md"
+          echo "diff: $(wc -l < "$RUNNER_TEMP/full.diff") lines, $(wc -c < "$RUNNER_TEMP/full.diff") bytes"
 
-          diff ของ PR แนบมาเป็นไฟล์ (เทียบ ${BASE_SHA}...HEAD) ใช้ git diff / git show / อ่านไฟล์ได้ ห้ามแก้ไฟล์
-
-          ขอบเขต: ตรวจทุกอย่างที่อาจทำให้ระบบผิด ไม่จำกัดแค่รายการข้างล่าง
-          - bug เชิงตรรกะ, off-by-one, เงื่อนไขผิด, null/undefined, async ที่ไม่ได้ await, error ที่ถูกกลืน
-          - transaction/ความสอดคล้องของข้อมูล, race condition, optimistic lock, running number/เลขเอกสาร
-          - ความปลอดภัย (SQL injection, raw query, authz), การตรวจ input/DTO
-          - เงิน/ตัวเลข (float vs Decimal), วันที่และ timezone (Asia/Bangkok), period lock
-          - business rule ของเอกสาร (สถานะ, การยกเลิก, เครดิตลูกค้า, stock reservation)
-
-          กติกา:
-          - อ่านโค้ดรอบ ๆ ที่เกี่ยวข้องก่อนสรุป อย่ารายงานสิ่งที่ถูกต้องอยู่แล้ว (เช่น tagged template \$queryRaw/\$executeRaw ปลอดภัย)
-          - ไม่เกิน 15 ประเด็น หนึ่งประเด็นต่อหนึ่งจุดในโค้ด
-          - line = เลขบรรทัดในไฟล์เวอร์ชันใหม่ (HEAD) ที่ปัญหาอยู่ ต้องอยู่ในช่วงที่ comment ได้ด้านล่าง ถ้าปัญหาอยู่นอกช่วง ให้เลือกบรรทัดใน diff ที่เกี่ยวข้องที่สุด หรือใส่ path/line จริงไว้ (ระบบจะย้ายไปไว้ในสรุป)
-          - start_line (ไม่บังคับ) ใช้เมื่อปัญหาครอบหลายบรรทัด ต้องอยู่ใน hunk เดียวกับ line
-          - suggestion (ไม่บังคับ) = โค้ดใหม่ทั้งก้อนที่จะ "แทนที่" บรรทัด start_line..line ทุกบรรทัด พร้อม indent เดิม ใส่เฉพาะเมื่อมั่นใจและแก้ได้ในจุดนั้นจริง ไม่ต้องใส่ backticks
-
-          ช่วงบรรทัดที่ comment ได้ (ไฟล์: ช่วงบรรทัดใน HEAD):
-          ${RANGES}
-
-          ตอบกลับด้วย JSON เท่านั้นระหว่าง marker ด้านล่าง (ไม่มีข้อความอื่นนอก marker):
-          <<<FINDINGS_JSON
-          {"summary": "สรุป 2-3 บรรทัด", "findings": [{"path": "src/x.ts", "line": 42, "start_line": 40, "severity": "critical|high|medium|low", "title": "หัวข้อสั้น", "body": "ปัญหา ผลกระทบ วิธีแก้", "suggestion": "โค้ดแทนที่ (ไม่บังคับ)"}]}
-          FINDINGS_JSON>>>
-          PROMPT
-          echo "diff: $(wc -l < "$RUNNER_TEMP/pr.diff") lines"; echo "$RANGES"
-
-      - name: OpenCode review (JSON findings)
-        if: github.event_name == 'pull_request'
-        timeout-minutes: 15
+      - name: OpenCode summary
+        if: steps.gate.outputs.run == 'true'
+        timeout-minutes: 8
         env:
           # opencode-go provider reads OPENCODE_API_KEY. No GitHub token is given to the model step.
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
@@ -128,22 +163,47 @@ jobs:
                "bash":{"*":"deny","git diff*":"allow","git show*":"allow","git log*":"allow"}}}
         run: |
           opencode run -m "$MODEL" -f "$RUNNER_TEMP/pr.diff" -- "$(cat "$RUNNER_TEMP/prompt.md")" \
-            | tee "$RUNNER_TEMP/opencode-output.txt"
+            > "$RUNNER_TEMP/opencode-output.txt"
+          echo "output: $(wc -c < "$RUNNER_TEMP/opencode-output.txt") bytes"
 
-      - name: Post inline review
-        if: github.event_name == 'pull_request'
+      - name: Post sticky summary comment
+        if: steps.gate.outputs.run == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 .github/scripts/opencode_inline_review.py post "$RUNNER_TEMP/pr.diff" "$RUNNER_TEMP/opencode-output.txt"
+        shell: python3 {0}
+        run: |
+          import json, os, re, sys, urllib.request
 
-      # ---------- On demand (/oc comments): OpenCode's own GitHub agent replies in the thread ----------
-      - name: OpenCode (/oc command)
-        if: github.event_name != 'pull_request'
-        env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
-          GITHUB_TOKEN: ${{ github.token }}
-          USE_GITHUB_TOKEN: "true"
-        run: opencode github run
+          out = open(os.path.join(os.environ['RUNNER_TEMP'], 'opencode-output.txt'), encoding='utf-8').read()
+          out = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', out)
+          m = re.findall(r'<<<SUMMARY\s*\n(.*?)\n?\s*SUMMARY>>>', out, flags=re.S)
+          text = (m[-1] if m else '').strip()
+          if not text or text == '...markdown...':
+              print('::error::OpenCode returned no summary between the markers')
+              sys.exit(1)
+          marker = os.environ['MARKER']
+          body = (f"{marker}\n## 📝 สรุป PR อัตโนมัติ (OpenCode)\n"
+                  f"> PR นี้ยังไม่มี description จึงสรุปจาก diff ที่ `{os.environ['HEAD_SHA'][:7]}` "
+                  f"(สรุปอย่างเดียว ไม่ใช่การรีวิว) ถ้าเขียน description แล้ว comment นี้จะไม่ถูกอัปเดตอีก\n\n{text}\n")
+
+          api = f"https://api.github.com/repos/{os.environ['REPO']}"
+          hdr = {'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
+                 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}
+          def call(method, url, data=None):
+              req = urllib.request.Request(url, method=method, headers=hdr,
+                                           data=json.dumps(data).encode() if data else None)
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+
+          comments = call('GET', f"{api}/issues/{os.environ['PR_NUMBER']}/comments?per_page=100")
+          mine = [c for c in comments if marker in (c.get('body') or '')
+                  and c.get('user', {}).get('login') == 'github-actions[bot]']
+          if mine:
+              c = call('PATCH', f"{api}/issues/comments/{mine[0]['id']}", {'body': body})
+              print(f"updated summary comment {c['html_url']}")
+          else:
+              c = call('POST', f"{api}/issues/{os.environ['PR_NUMBER']}/comments", {'body': body})
+              print(f"posted summary comment {c['html_url']}")
