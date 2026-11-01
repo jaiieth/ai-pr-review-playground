@@ -17,3 +17,5 @@ export class ArService {
     });
   }
 }
+
+export const RECEIPT_PREFIX = 'RC';
