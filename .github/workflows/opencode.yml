@@ -2,12 +2,16 @@ name: OpenCode PR Summary
 
 # Summary only (no review findings, no inline comments): when a PR has no real description,
 # OpenCode writes a short Thai summary (what the PR is about, main changes, risk areas) and posts
-# it as ONE sticky PR comment (updated in place). The PR body is never edited.
-# OCR (ocr-review.yml) is the reviewer.
+# it as ONE sticky PR comment. The PR body is never edited. OCR (ocr-review.yml) is the reviewer.
 # Every trigger goes through the same gates (checked in the first step, against the live PR):
 #   body has < OPENCODE_SUMMARY_MIN_CHARS meaningful chars, diff not empty (changed_files > 0),
-#   the existing summary (if any) is for an older head SHA, OPENCODE_GO_API_KEY available.
-# New commits refresh the summary (same comment, records the head SHA it reflects).
+#   the summary (if any) does not cover the current head SHA yet, OPENCODE_GO_API_KEY available.
+# First summary = whole PR (base...head). Later pushes do NOT regenerate it: an update section
+# for only the new commits is appended to the same comment. The comment keeps the last summarized
+# SHA in a hidden marker; the range is event.before..head when before == that SHA, otherwise
+# (force-push, label re-add, ready) last-SHA..head; if last-SHA is no longer an ancestor of head
+# (rewritten history) or the comment is near GitHub's size limit, the whole summary is regenerated.
+# Commits merged in from the base branch are left out of updates (first-parent, no merges).
 # Triggers:
 #   opened / reopened / ready_for_review / synchronize -> non-draft PRs, head branch not in the
 #       skip list; drafts only when they carry OCR_TRIGGER_LABEL (in review) or
@@ -72,6 +76,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          EVENT_BEFORE: ${{ github.event.before }}   # synchronize only
         shell: python3 {0}
         run: |
           import json, os, re, sys, urllib.request
@@ -105,7 +110,7 @@ jobs:
           threshold = int(os.environ['MIN_CHARS'])
           print(f"PR #{pr_number}: state={pr['state']} draft={pr['draft']} "
                 f"changed_files={pr['changed_files']} description={chars} meaningful chars (threshold {threshold})")
-          reason = None
+          reason, mode, from_sha = None, 'full', ''
           if pr['state'] != 'open':
               reason = 'PR is not open'
           elif chars >= threshold:
@@ -116,12 +121,20 @@ jobs:
               reason = 'OPENCODE_GO_API_KEY is not available (fork PR, or Dependabot without a Dependabot secret)'
           else:
               comments = get(f"{api}/issues/{pr_number}/comments?per_page=100")
-              tag = f"<!-- opencode-pr-summary-sha: {pr['head']['sha']} -->"
-              if any(tag in (c.get('body') or '') for c in comments):
-                  reason = 'summary is already up to date for this head SHA'
-          print(f'skip: {reason}' if reason else 'summarize')
+              mine = [c for c in comments if os.environ['MARKER'] in (c.get('body') or '')
+                      and c.get('user', {}).get('login') == 'github-actions[bot]']
+              if mine:
+                  m = re.search(r'<!-- opencode-pr-summary-sha: ([0-9a-f]{40}) -->', mine[0]['body'])
+                  last = m.group(1) if m else ''
+                  if last == pr['head']['sha']:
+                      reason = 'summary already covers this head SHA'
+                  elif last and len(mine[0]['body']) < 55000:
+                      mode = 'update'
+                      before = os.environ.get('EVENT_BEFORE') or ''
+                      from_sha = before if before == last else last
+          print(f'skip: {reason}' if reason else f'mode={mode} from={from_sha or "-"}')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"run={'false' if reason else 'true'}\n")
+              f.write(f"run={'false' if reason else 'true'}\nmode={mode}\nfrom_sha={from_sha}\n")
               f.write(f"base_sha={pr['base']['sha']}\nhead_sha={pr['head']['sha']}\n")
           with open(os.path.join(os.environ['RUNNER_TEMP'], 'pr-title.txt'), 'w', encoding='utf-8') as f:
               f.write(pr['title'])
@@ -149,47 +162,82 @@ jobs:
         run: curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
 
       - name: Prepare diff and prompt
+        id: prep
         if: steps.gate.outputs.run == 'true'
         env:
           BASE_SHA: ${{ steps.gate.outputs.base_sha }}
+          MODE: ${{ steps.gate.outputs.mode }}
+          FROM_SHA: ${{ steps.gate.outputs.from_sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           MAX_DIFF_BYTES: "400000"
         run: |
           PR_TITLE="$(cat "$RUNNER_TEMP/pr-title.txt")"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-          git diff --no-color --stat=200 "$BASE_SHA"...HEAD > "$RUNNER_TEMP/stat.txt"
-          git diff --no-color "$BASE_SHA"...HEAD > "$RUNNER_TEMP/full.diff"
+          if [ "$MODE" = update ] && ! git merge-base --is-ancestor "$FROM_SHA" HEAD 2>/dev/null; then
+            echo "last summarized SHA ${FROM_SHA:0:7} is not an ancestor of head (rewritten history): regenerate"
+            MODE=full
+          fi
+          if [ "$MODE" = update ]; then
+            RANGE="${FROM_SHA}..HEAD"
+            # Only this branch's own commits; base-branch merges are not part of the PR's work.
+            LOG=(git log --first-parent --no-merges --reverse "$RANGE")
+            # shellcheck disable=SC2016  # literal backticks: markdown code span around %h
+            "${LOG[@]}" --format='- `%h` %s' | head -n 30 > "$RUNNER_TEMP/commits.md"
+            if [ ! -s "$RUNNER_TEMP/commits.md" ]; then
+              echo "no own commits in $RANGE (base merge only): only the SHA marker moves"
+              echo "mode=marker" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            "${LOG[@]}" --no-color --stat=200 --format='commit %h %s' > "$RUNNER_TEMP/stat.txt"
+            "${LOG[@]}" --no-color -p --format='commit %h %s' > "$RUNNER_TEMP/full.diff"
+          else
+            RANGE="${BASE_SHA}...HEAD"
+            git diff --no-color --stat=200 "$RANGE" > "$RUNNER_TEMP/stat.txt"
+            git diff --no-color "$RANGE" > "$RUNNER_TEMP/full.diff"
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           head -c "$MAX_DIFF_BYTES" "$RUNNER_TEMP/full.diff" > "$RUNNER_TEMP/pr.diff"
           NOTE=""
           if [ "$(wc -c < "$RUNNER_TEMP/full.diff")" -gt "$MAX_DIFF_BYTES" ]; then
-            NOTE="(diff ยาวเกิน แนบมาแค่ส่วนแรก ดูไฟล์ที่เหลือได้ด้วย git diff ${BASE_SHA}...HEAD -- <path>)"
+            NOTE="(diff ยาวเกิน แนบมาแค่ส่วนแรก ดูส่วนที่เหลือได้ด้วย git diff / git show)"
           fi
           {
-            echo "สรุป Pull Request #${PR_NUMBER} \"${PR_TITLE}\" เป็นภาษาไทย (ศัพท์เทคนิค ชื่อไฟล์ และชื่อโค้ดใช้ภาษาอังกฤษได้) สำหรับคนที่จะมา review"
-            echo "PR นี้ไม่มี description ให้อ่านจาก diff ที่แนบมา (เทียบ ${BASE_SHA}...HEAD) ${NOTE}"
-            echo "ใช้ git diff / git show / git log หรืออ่านไฟล์ได้ ห้ามแก้ไฟล์"
-            echo
-            echo "ไฟล์ที่เปลี่ยน:"
-            cat "$RUNNER_TEMP/stat.txt"
-            echo
-            echo "หน้าที่: สรุปเท่านั้น ไม่ต้องรีวิว ไม่ต้องหาบั๊ก ไม่ต้องเสนอวิธีแก้ (มีเครื่องมือรีวิวแยกต่างหาก)"
-            echo "เขียนเป็น Markdown สั้น กระชับ ไม่เกินประมาณ 25 บรรทัด มี 3 หัวข้อนี้ตามลำดับ:"
-            echo "### PR นี้เกี่ยวกับอะไร"
-            echo "1-3 ประโยค บอกจุดประสงค์ของงาน (module/เอกสาร/endpoint ที่เกี่ยวข้อง)"
-            echo "### การเปลี่ยนแปลงหลัก"
-            echo "bullet 3-8 ข้อ จัดกลุ่มตาม module หรือไฟล์ ระบุ endpoint, schema/migration, config ที่เพิ่มหรือเปลี่ยน"
-            echo "### จุดที่ reviewer ควรดูเป็นพิเศษ"
-            echo "bullet 1-5 ข้อ ว่าส่วนไหนเสี่ยงหรือกระทบวงกว้าง (เช่น schema/migration, transaction, เงิน/วันที่, สิทธิ์, การเปลี่ยน API ที่มีคนเรียกอยู่) บอกแค่ว่าควรดูตรงไหนเพราะอะไร ไม่ต้องตัดสินว่าผิด"
+            if [ "$MODE" = update ]; then
+              echo "Pull Request #${PR_NUMBER} \"${PR_TITLE}\" มีสรุปทั้ง PR แล้ว ตอนนี้มี commit ใหม่เพิ่มเข้ามา"
+              echo "สรุปเฉพาะการเปลี่ยนแปลงใน commit ใหม่เหล่านี้ (${RANGE}) เป็นภาษาไทย (ศัพท์เทคนิค ชื่อไฟล์ และชื่อโค้ดใช้ภาษาอังกฤษได้) ${NOTE}"
+              echo "diff ที่แนบมาคือ patch ของแต่ละ commit ใช้ git show / git log หรืออ่านไฟล์ได้ ห้ามแก้ไฟล์"
+              echo
+              cat "$RUNNER_TEMP/stat.txt"
+              echo
+              echo "หน้าที่: สรุปเท่านั้น ไม่ต้องรีวิว ไม่ต้องหาบั๊ก ไม่ต้องเสนอวิธีแก้"
+              echo "เขียนเป็น Markdown bullet 2-6 ข้อ ไม่มีหัวข้อ บอกว่า commit ใหม่เพิ่ม/เปลี่ยนอะไร และถ้ามีส่วนเสี่ยงที่ reviewer ควรดู ให้ใส่เป็น bullet สุดท้ายขึ้นต้นด้วย \"ควรดู:\""
+            else
+              echo "สรุป Pull Request #${PR_NUMBER} \"${PR_TITLE}\" เป็นภาษาไทย (ศัพท์เทคนิค ชื่อไฟล์ และชื่อโค้ดใช้ภาษาอังกฤษได้) สำหรับคนที่จะมา review"
+              echo "PR นี้ไม่มี description ให้อ่านจาก diff ที่แนบมา (เทียบ ${RANGE}) ${NOTE}"
+              echo "ใช้ git diff / git show / git log หรืออ่านไฟล์ได้ ห้ามแก้ไฟล์"
+              echo
+              echo "ไฟล์ที่เปลี่ยน:"
+              cat "$RUNNER_TEMP/stat.txt"
+              echo
+              echo "หน้าที่: สรุปเท่านั้น ไม่ต้องรีวิว ไม่ต้องหาบั๊ก ไม่ต้องเสนอวิธีแก้ (มีเครื่องมือรีวิวแยกต่างหาก)"
+              echo "เขียนเป็น Markdown สั้น กระชับ ไม่เกินประมาณ 25 บรรทัด มี 3 หัวข้อนี้ตามลำดับ:"
+              echo "### PR นี้เกี่ยวกับอะไร"
+              echo "1-3 ประโยค บอกจุดประสงค์ของงาน (module/เอกสาร/endpoint ที่เกี่ยวข้อง)"
+              echo "### การเปลี่ยนแปลงหลัก"
+              echo "bullet 3-8 ข้อ จัดกลุ่มตาม module หรือไฟล์ ระบุ endpoint, schema/migration, config ที่เพิ่มหรือเปลี่ยน"
+              echo "### จุดที่ reviewer ควรดูเป็นพิเศษ"
+              echo "bullet 1-5 ข้อ ว่าส่วนไหนเสี่ยงหรือกระทบวงกว้าง (เช่น schema/migration, transaction, เงิน/วันที่, สิทธิ์, การเปลี่ยน API ที่มีคนเรียกอยู่) บอกแค่ว่าควรดูตรงไหนเพราะอะไร ไม่ต้องตัดสินว่าผิด"
+            fi
             echo
             echo "ตอบกลับด้วยสรุปเท่านั้น ระหว่าง marker ด้านล่าง (ไม่มีข้อความอื่นนอก marker):"
             echo "<<<SUMMARY"
             echo "...markdown..."
             echo "SUMMARY>>>"
           } > "$RUNNER_TEMP/prompt.md"
-          echo "diff: $(wc -l < "$RUNNER_TEMP/full.diff") lines, $(wc -c < "$RUNNER_TEMP/full.diff") bytes"
+          echo "mode=$MODE range=$RANGE diff: $(wc -l < "$RUNNER_TEMP/full.diff") lines, $(wc -c < "$RUNNER_TEMP/full.diff") bytes"
 
       - name: OpenCode summary
-        if: steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'true' && steps.prep.outputs.mode != 'marker'
         timeout-minutes: 8
         env:
           # opencode-go provider reads OPENCODE_API_KEY. No GitHub token is given to the model step.
@@ -209,24 +257,26 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          BASE_SHA: ${{ steps.gate.outputs.base_sha }}
           HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
+          FROM_SHA: ${{ steps.gate.outputs.from_sha }}
+          MODE: ${{ steps.prep.outputs.mode }}
         shell: python3 {0}
         run: |
           import json, os, re, sys, urllib.request
 
-          out = open(os.path.join(os.environ['RUNNER_TEMP'], 'opencode-output.txt'), encoding='utf-8').read()
-          out = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', out)
-          m = re.findall(r'<<<SUMMARY\s*\n(.*?)\n?\s*SUMMARY>>>', out, flags=re.S)
-          text = (m[-1] if m else '').strip()
-          if not text or text == '...markdown...':
-              print('::error::OpenCode returned no summary between the markers')
-              sys.exit(1)
-          marker = os.environ['MARKER']
-          sha = os.environ['HEAD_SHA']
-          body = (f"{marker}\n<!-- opencode-pr-summary-sha: {sha} -->\n## 📝 สรุป PR อัตโนมัติ (OpenCode)\n"
-                  f"> PR นี้ยังไม่มี description จึงสรุปจาก diff ถึง commit `{sha[:7]}` "
-                  f"(สรุปอย่างเดียว ไม่ใช่การรีวิว) comment นี้อัปเดตเองเมื่อมี commit ใหม่ "
-                  f"และหยุดอัปเดตเมื่อเขียน description แล้ว\n\n{text}\n")
+          tmp, mode = os.environ['RUNNER_TEMP'], os.environ['MODE']
+          marker, head = os.environ['MARKER'], os.environ['HEAD_SHA']
+          sha_tag = f"<!-- opencode-pr-summary-sha: {head} -->"
+          text = ''
+          if mode != 'marker':
+              out = open(os.path.join(tmp, 'opencode-output.txt'), encoding='utf-8').read()
+              out = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', out)
+              m = re.findall(r'<<<SUMMARY\s*\n(.*?)\n?\s*SUMMARY>>>', out, flags=re.S)
+              text = (m[-1] if m else '').strip()
+              if not text or text == '...markdown...':
+                  print('::error::OpenCode returned no summary between the markers')
+                  sys.exit(1)
 
           api = f"https://api.github.com/repos/{os.environ['REPO']}"
           hdr = {'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
@@ -240,9 +290,28 @@ jobs:
           comments = call('GET', f"{api}/issues/{os.environ['PR_NUMBER']}/comments?per_page=100")
           mine = [c for c in comments if marker in (c.get('body') or '')
                   and c.get('user', {}).get('login') == 'github-actions[bot]']
+          tag_re = r'<!-- opencode-pr-summary-sha: [0-9a-f]{40} -->'
+          if mode in ('update', 'marker'):
+              if not mine or not re.search(tag_re, mine[0]['body']):
+                  print('::error::summary comment disappeared; re-run to regenerate')
+                  sys.exit(1)
+              old = re.sub(tag_re, sha_tag, mine[0]['body']).rstrip()
+              if mode == 'marker':
+                  body = old + '\n'
+              else:
+                  commits = open(os.path.join(tmp, 'commits.md'), encoding='utf-8').read().strip()
+                  n = len(commits.splitlines())
+                  body = (f"{old}\n\n---\n### 🔄 อัปเดต `{os.environ['FROM_SHA'][:7]}..{head[:7]}` ({n} commit)\n"
+                          f"{commits}\n\n{text}\n")
+          else:
+              body = (f"{marker}\n{sha_tag}\n## 📝 สรุป PR อัตโนมัติ (OpenCode)\n"
+                      f"> PR นี้ยังไม่มี description จึงสรุปจาก diff ทั้ง PR "
+                      f"`{os.environ['BASE_SHA'][:7]}...{head[:7]}` (สรุปอย่างเดียว ไม่ใช่การรีวิว) "
+                      f"commit ที่ push เพิ่มจะถูกสรุปต่อท้ายเป็นส่วน \"อัปเดต\" "
+                      f"และ comment นี้จะหยุดอัปเดตเมื่อเขียน description แล้ว\n\n{text}\n")
           if mine:
               c = call('PATCH', f"{api}/issues/comments/{mine[0]['id']}", {'body': body})
-              print(f"updated summary comment {c['html_url']}")
+              print(f"{mode}: updated summary comment {c['html_url']}")
           else:
               c = call('POST', f"{api}/issues/{os.environ['PR_NUMBER']}/comments", {'body': body})
-              print(f"posted summary comment {c['html_url']}")
+              print(f"{mode}: posted summary comment {c['html_url']}")
