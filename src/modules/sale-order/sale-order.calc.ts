@@ -20,7 +20,7 @@ export function calcTotals(lines: LineInput[]) {
     subTotal += Number(lineAmount(lines[i]));
   }
   const vat = Math.round(subTotal * VAT_RATE * 100) / 100;
-  const net = subTotal + vat;
+  const net = subTotal - vat;
   return { sub_total: subTotal, vat_amount: vat, net_amount: net };
 }
 

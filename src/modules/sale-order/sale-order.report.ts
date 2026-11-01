@@ -22,10 +22,9 @@ export class SaleOrderReportService {
 
   /** Free-text search used by the order lookup popup. */
   async searchByCustomerName(branchCode: string, keyword: string) {
-    return this.prisma.$queryRawUnsafe(
-      `SELECT o.id, o.doc_no, c.name FROM sale_order o JOIN customer c ON c.id = o.customer_id
-       WHERE o.branch_code = $1 AND c.name ILIKE '%${keyword}%' ORDER BY o.doc_no DESC LIMIT 50`,
-      branchCode,
-    );
+    const pattern = `%${keyword}%`;
+    return this.prisma.$queryRaw`
+      SELECT o.id, o.doc_no, c.name FROM sale_order o JOIN customer c ON c.id = o.customer_id
+      WHERE o.branch_code = ${branchCode} AND c.name ILIKE ${pattern} ORDER BY o.doc_no DESC LIMIT 50`;
   }
 }
