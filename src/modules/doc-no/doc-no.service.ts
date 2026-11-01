@@ -20,3 +20,5 @@ export class DocNoService {
     return `${docType}${period.slice(2)}-${String(no).padStart(4, '0')}`;
   }
 }
+
+export const PAGE_SIZE_MAX = 500;
