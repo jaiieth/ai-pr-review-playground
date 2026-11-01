@@ -2,41 +2,56 @@ name: OpenCode PR Summary
 
 # Summary only (no review findings, no inline comments): when a PR has no real description,
 # OpenCode writes a short Thai summary (what the PR is about, main changes, risk areas) and posts
-# it as ONE sticky PR comment (updated in place). The PR body is never edited.
-# OCR (ocr-review.yml) is the reviewer.
-# Runs on: opened / reopened / ready_for_review, edited (only when the body changed, e.g. cleared),
-# and synchronize only while the body is empty and no summary exists yet (e.g. the PR was opened
-# with an empty first commit). Skipped at job level (0 minutes) for: drafts, PRs with no changed
-# files, release/sync head branches. PRs whose body has >= OPENCODE_SUMMARY_MIN_CHARS meaningful
-# characters stop at the first step on a 1-vCPU runner (1 minute at the slim rate).
+# it as ONE PR comment. The PR body is never edited. OCR (ocr-review.yml) is the reviewer.
+# Every trigger goes through the same gates (checked in the first step, against the live PR):
+#   body has < OPENCODE_SUMMARY_MIN_CHARS meaningful chars, diff not empty (changed_files > 0),
+#   no summary comment yet (posted once, never regenerated), OPENCODE_GO_API_KEY available.
+# Triggers:
+#   opened / reopened / ready_for_review / synchronize -> non-draft PRs (drafts only if
+#       OPENCODE_SUMMARY_DRAFTS == 'true'), head branch not in the skip list
+#   edited                       -> only when the body changed
+#   labeled with OCR_TRIGGER_LABEL (ai-review) -> drafts too (same label that triggers OCR)
+#   workflow_dispatch(pr_number) -> drafts too
+# Skips that need no API call (draft, empty diff, other labels, skip-list head branch) cost 0 minutes.
 # Required secret: OPENCODE_GO_API_KEY. Optional repo variables:
 #   OPENCODE_MODEL            default opencode-go/deepseek-v4.1-flash
 #   OPENCODE_SUMMARY_MIN_CHARS default 30  (non-space characters left after removing HTML comments,
 #                                           headings, checklist items and empty bullets)
-#   OPENCODE_SUMMARY_DRAFTS   default false (true = also summarize drafts)
+#   OPENCODE_SUMMARY_DRAFTS   default false (true = also summarize drafts on open/push)
+#   OCR_TRIGGER_LABEL         default ai-review     (shared with ocr-review.yml)
 #   AI_SKIP_HEAD_BRANCHES     default main,develop  (shared with ocr-review.yml)
 #   AI_SKIP_HEAD_PREFIX       default release/      (shared with ocr-review.yml; - disables)
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review, edited, synchronize]
+    types: [opened, reopened, ready_for_review, edited, synchronize, labeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to summarize (drafts included; still skipped if it has a description)
+        required: true
+        type: string
 
 permissions: {}
 
 jobs:
   summary:
     if: >
-      github.event.pull_request.changed_files > 0 &&
-      (github.event.action != 'edited' || github.event.changes.body != null) &&
-      (github.event.action != 'synchronize' || !github.event.pull_request.body) &&
-      !contains(format(',{0},', vars.AI_SKIP_HEAD_BRANCHES || 'main,develop'), format(',{0},', github.head_ref)) &&
-      !(vars.AI_SKIP_HEAD_PREFIX != '-' && startsWith(github.head_ref, vars.AI_SKIP_HEAD_PREFIX || 'release/')) &&
-      (!github.event.pull_request.draft || vars.OPENCODE_SUMMARY_DRAFTS == 'true')
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.changed_files > 0 &&
+       ((github.event.action == 'labeled' &&
+         github.event.label.name == (vars.OCR_TRIGGER_LABEL || 'ai-review')) ||
+        (github.event.action != 'labeled' &&
+         (github.event.action != 'edited' || github.event.changes.body != null) &&
+         (github.event.action != 'synchronize' || !github.event.pull_request.body) &&
+         !contains(format(',{0},', vars.AI_SKIP_HEAD_BRANCHES || 'main,develop'), format(',{0},', github.head_ref)) &&
+         !(vars.AI_SKIP_HEAD_PREFIX != '-' && startsWith(github.head_ref, vars.AI_SKIP_HEAD_PREFIX || 'release/')) &&
+         (!github.event.pull_request.draft || vars.OPENCODE_SUMMARY_DRAFTS == 'true'))))
     # API-bound work only: the 1-vCPU runner (15-minute job limit) bills at the slim rate.
     runs-on: ubuntu-slim
     timeout-minutes: 12
     concurrency:
-      group: opencode-summary-${{ github.event.pull_request.number }}
+      group: opencode-summary-${{ github.event.pull_request.number || inputs.pr_number }}
       cancel-in-progress: true
     permissions:
       contents: read
@@ -49,15 +64,26 @@ jobs:
       - name: Check description
         id: gate
         env:
-          BODY: ${{ github.event.pull_request.body }}
-          ACTION: ${{ github.event.action }}
           MIN_CHARS: ${{ vars.OPENCODE_SUMMARY_MIN_CHARS || '30' }}
+          HAS_KEY: ${{ secrets.OPENCODE_GO_API_KEY != '' }}   # boolean only, never the value
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
         shell: python3 {0}
         run: |
-          import json, os, re, urllib.request
+          import json, os, re, sys, urllib.request
+
+          pr_number = os.environ['PR_NUMBER']
+          if not re.fullmatch(r'[1-9][0-9]*', pr_number):
+              print(f'::error::invalid pr_number {pr_number!r}')
+              sys.exit(1)
+          api = f"https://api.github.com/repos/{os.environ['REPO']}"
+          def get(url):
+              req = urllib.request.Request(url, headers={
+                  'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
 
           def meaningful(body):
               body = re.sub(r'<!--.*?-->', '', body or '', flags=re.S)
@@ -71,29 +97,36 @@ jobs:
                   keep.append(re.sub(r'^[-*+>]\s*', '', n))
               return ''.join(''.join(keep).split())
 
-          chars = len(meaningful(os.environ.get('BODY')))
-          run = chars < int(os.environ['MIN_CHARS'])
-          print(f"description: {chars} meaningful chars (threshold {os.environ['MIN_CHARS']})")
-          if run and os.environ['ACTION'] == 'synchronize':
-              url = (f"https://api.github.com/repos/{os.environ['REPO']}/issues/"
-                     f"{os.environ['PR_NUMBER']}/comments?per_page=100")
-              req = urllib.request.Request(url, headers={
-                  'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
-                  'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  comments = json.load(r)
+          pr = get(f"{api}/pulls/{pr_number}")   # live state (body may have changed since the event)
+          chars = len(meaningful(pr.get('body')))
+          threshold = int(os.environ['MIN_CHARS'])
+          print(f"PR #{pr_number}: state={pr['state']} draft={pr['draft']} "
+                f"changed_files={pr['changed_files']} description={chars} meaningful chars (threshold {threshold})")
+          reason = None
+          if pr['state'] != 'open':
+              reason = 'PR is not open'
+          elif chars >= threshold:
+              reason = 'PR has a description'
+          elif pr['changed_files'] == 0:
+              reason = 'empty diff (e.g. only an empty first commit)'
+          elif os.environ['HAS_KEY'] != 'true':
+              reason = 'OPENCODE_GO_API_KEY is not available (fork PR, or Dependabot without a Dependabot secret)'
+          else:
+              comments = get(f"{api}/issues/{pr_number}/comments?per_page=100")
               if any(os.environ['MARKER'] in (c.get('body') or '') for c in comments):
-                  print('summary already posted; push does not regenerate it')
-                  run = False
-          print('summarize' if run else 'skip')
+                  reason = 'summary already posted (it is never regenerated)'
+          print(f'skip: {reason}' if reason else 'summarize')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"run={'true' if run else 'false'}\n")
+              f.write(f"run={'false' if reason else 'true'}\n")
+              f.write(f"base_sha={pr['base']['sha']}\nhead_sha={pr['head']['sha']}\n")
+          with open(os.path.join(os.environ['RUNNER_TEMP'], 'pr-title.txt'), 'w', encoding='utf-8') as f:
+              f.write(pr['title'])
 
       - name: Checkout
         if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: refs/pull/${{ github.event.pull_request.number || inputs.pr_number }}/head
           fetch-depth: 0
           persist-credentials: false
 
@@ -114,11 +147,11 @@ jobs:
       - name: Prepare diff and prompt
         if: steps.gate.outputs.run == 'true'
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ steps.gate.outputs.base_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           MAX_DIFF_BYTES: "400000"
         run: |
+          PR_TITLE="$(cat "$RUNNER_TEMP/pr-title.txt")"
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           git diff --no-color --stat=200 "$BASE_SHA"...HEAD > "$RUNNER_TEMP/stat.txt"
           git diff --no-color "$BASE_SHA"...HEAD > "$RUNNER_TEMP/full.diff"
@@ -171,8 +204,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
         shell: python3 {0}
         run: |
           import json, os, re, sys, urllib.request
