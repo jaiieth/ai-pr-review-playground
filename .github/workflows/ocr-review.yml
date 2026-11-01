@@ -8,7 +8,9 @@ name: OCR Review
 #   OCR_THINKING           default on                    (on | off; anthropic on = budget_tokens 8000)
 #   OCR_REVIEW_DRAFTS      default false                 (true = also review draft PRs on open/push)
 #   OCR_TRIGGER_LABEL      default ai-review             (adding it reviews the PR now, draft or not;
-#                                                         a draft carrying it is reviewed on every push)
+#                                                         remove + re-add to run again; ClickUp "Review")
+#   OCR_ON_READY           default false                 (true = also review on ready_for_review; may
+#                                                         duplicate a label-triggered review)
 #   AI_SKIP_HEAD_BRANCHES  default main,develop          (comma list, no spaces; head branches never
 #                                                         reviewed = release/sync PRs; shared with opencode.yml)
 #   AI_SKIP_HEAD_PREFIX    default release/              (head branches starting with it are skipped;
@@ -60,14 +62,22 @@ jobs:
     #     Task PRs branch-x -> main ARE reviewed.
     #   - drafts, unless OCR_REVIEW_DRAFTS == 'true' or the PR carries OCR_TRIGGER_LABEL
     # workflow_dispatch always runs for the given PR number.
+    # Triggers:
+    #   workflow_dispatch(pr_number)            -> always (drafts too)
+    #   labeled with OCR_TRIGGER_LABEL          -> always (drafts too, skip list ignored: explicit request);
+    #                                              remove + re-add the label to run again
+    #   ready_for_review                        -> only when OCR_ON_READY == 'true'
+    #   opened / reopened / synchronize         -> non-draft PRs (drafts only if OCR_REVIEW_DRAFTS == 'true'),
+    #                                              head branch not in the skip list
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       (github.event.action != 'labeled' || github.event.label.name == (vars.OCR_TRIGGER_LABEL || 'ai-review')) &&
+      (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+       github.event.label.name == (vars.OCR_TRIGGER_LABEL || 'ai-review')) ||
+      (github.event_name == 'pull_request' && github.event.action != 'labeled' &&
+       (github.event.action != 'ready_for_review' || vars.OCR_ON_READY == 'true') &&
        !contains(format(',{0},', vars.AI_SKIP_HEAD_BRANCHES || 'main,develop'), format(',{0},', github.head_ref)) &&
        !(vars.AI_SKIP_HEAD_PREFIX != '-' && startsWith(github.head_ref, vars.AI_SKIP_HEAD_PREFIX || 'release/')) &&
-       (!github.event.pull_request.draft || vars.OCR_REVIEW_DRAFTS == 'true' ||
-        contains(github.event.pull_request.labels.*.name, vars.OCR_TRIGGER_LABEL || 'ai-review')))
+       (!github.event.pull_request.draft || vars.OCR_REVIEW_DRAFTS == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # One review per PR at a time; a newer push cancels the running review (the next run reviews
