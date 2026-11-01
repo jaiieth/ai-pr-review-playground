@@ -1,8 +1,10 @@
 name: OpenCode Review
 
 # Third reviewer, runs in parallel with ocr-review.yml and pr-agent.yml.
-# - Auto: one Thai review comment when a PR is opened / reopened / marked ready.
-#   (Not on every push: OpenCode posts a NEW comment per run; use `/oc` to re-review.)
+# - Auto: one Thai PR review with INLINE comments when a PR is opened / reopened / marked ready.
+#   OpenCode CLI (read-only: no edits, bash limited to git diff/show/log) returns JSON findings;
+#   .github/scripts/opencode_inline_review.py checks each line against the diff and posts one
+#   review. Findings outside the diff go into the review body. Not on every push: use `/oc`.
 # - On demand: comment `/oc ...` or `/opencode ...` on a PR (or on a diff line).
 # Docs: https://opencode.ai/docs/github/
 
@@ -42,43 +44,106 @@ jobs:
       group: opencode-${{ github.event_name == 'pull_request' && 'auto' || 'cmd' }}-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: false
     # Review-only: no contents:write, so OpenCode cannot push commits or open PRs.
+    # pull-requests:write is needed to create the review with inline comments.
     permissions:
       contents: read
       pull-requests: write
       issues: write
     env:
-      REVIEW_PROMPT: |
-        รีวิว Pull Request นี้ในฐานะ senior reviewer ของ ERP API (NestJS + Prisma + PostgreSQL) แล้วตอบเป็นภาษาไทยทั้งหมด (ศัพท์เทคนิค/ชื่อโค้ดใช้อังกฤษได้)
-
-        ขอบเขต: ตรวจทุกอย่างที่อาจทำให้ระบบผิด ไม่จำกัดแค่รายการข้างล่าง
-        - bug เชิงตรรกะ, off-by-one, เงื่อนไขผิด, null/undefined, async ที่ไม่ได้ await, error ที่ถูกกลืน
-        - transaction/ความสอดคล้องของข้อมูล, race condition, optimistic lock, running number/เลขเอกสาร
-        - ความปลอดภัย (SQL injection, raw query, authz), การตรวจ input/DTO
-        - เงิน/ตัวเลข (float vs Decimal), วันที่และ timezone (Asia/Bangkok), period lock
-        - business rule ของเอกสาร (สถานะ, การยกเลิก, เครดิตลูกค้า, stock reservation)
-
-        กติกา:
-        - อ่านโค้ดรอบ ๆ ที่เกี่ยวข้องก่อนสรุป อย่ารายงานสิ่งที่ถูกต้องอยู่แล้ว (เช่น tagged template $queryRaw/$executeRaw ปลอดภัย)
-        - แต่ละประเด็นให้ระบุ: ระดับ [critical|high|medium|low], ไฟล์:บรรทัด, ปัญหา, ผลกระทบ, วิธีแก้สั้น ๆ
-        - เรียงจากร้ายแรงมากไปน้อย ไม่เกิน 15 ประเด็น ปิดท้ายด้วยสรุป 2-3 บรรทัด
-        - ห้ามแก้ไขไฟล์ ห้าม commit/push ห้ามสร้าง branch หรือ PR ให้ตอบเป็นข้อความรีวิวเท่านั้น
+      OPENCODE_VERSION: "1.19.5"
+      MODEL: ${{ vars.OPENCODE_MODEL || 'opencode-go/deepseek-v4.1-flash' }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Auto review: PR head, so line numbers match the PR diff (default is the merge commit).
+          ref: ${{ github.event.pull_request.head.sha || '' }}
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: OpenCode (OpenCode Go)
-        # anomalyco/opencode/github v1.19.5
-        uses: anomalyco/opencode/github@810c0eba1a7348036f8bdf61e6632d0c36c6876c
-        env:
-          # opencode-go provider reads OPENCODE_API_KEY
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The action's installer otherwise pulls the latest CLI; pin it to the action version
-          VERSION: "1.19.5"
+      # Own install instead of anomalyco/opencode/github: its first step calls the GitHub API
+      # unauthenticated for the latest version and fails the job when the runner IP is rate
+      # limited (seen on PR #5). A pinned version downloads straight from the release assets.
+      - name: Cache opencode
+        id: cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          model: ${{ vars.OPENCODE_MODEL || 'opencode-go/deepseek-v4.1-flash' }}
-          use_github_token: true
-          # Auto runs use the Thai review prompt; /oc comments use the comment text as the prompt
-          prompt: ${{ github.event_name == 'pull_request' && env.REVIEW_PROMPT || '' }}
+          path: ~/.opencode/bin
+          key: opencode-${{ runner.os }}-${{ runner.arch }}-${{ env.OPENCODE_VERSION }}
+
+      - name: Install opencode
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION"
+
+      - name: Add opencode to PATH
+        run: echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      # ---------- Auto review (pull_request): JSON findings -> inline PR review ----------
+      - name: Prepare diff and prompt
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git diff --no-color "$BASE_SHA"...HEAD > "$RUNNER_TEMP/pr.diff"
+          RANGES=$(python3 .github/scripts/opencode_inline_review.py ranges "$RUNNER_TEMP/pr.diff")
+          cat > "$RUNNER_TEMP/prompt.md" <<PROMPT
+          รีวิว Pull Request #${PR_NUMBER} ในฐานะ senior reviewer ของ ERP API (NestJS + Prisma + PostgreSQL) เขียน title/body/summary เป็นภาษาไทย (ศัพท์เทคนิค/ชื่อโค้ดใช้อังกฤษได้)
+
+          diff ของ PR แนบมาเป็นไฟล์ (เทียบ ${BASE_SHA}...HEAD) ใช้ git diff / git show / อ่านไฟล์ได้ ห้ามแก้ไฟล์
+
+          ขอบเขต: ตรวจทุกอย่างที่อาจทำให้ระบบผิด ไม่จำกัดแค่รายการข้างล่าง
+          - bug เชิงตรรกะ, off-by-one, เงื่อนไขผิด, null/undefined, async ที่ไม่ได้ await, error ที่ถูกกลืน
+          - transaction/ความสอดคล้องของข้อมูล, race condition, optimistic lock, running number/เลขเอกสาร
+          - ความปลอดภัย (SQL injection, raw query, authz), การตรวจ input/DTO
+          - เงิน/ตัวเลข (float vs Decimal), วันที่และ timezone (Asia/Bangkok), period lock
+          - business rule ของเอกสาร (สถานะ, การยกเลิก, เครดิตลูกค้า, stock reservation)
+
+          กติกา:
+          - อ่านโค้ดรอบ ๆ ที่เกี่ยวข้องก่อนสรุป อย่ารายงานสิ่งที่ถูกต้องอยู่แล้ว (เช่น tagged template \$queryRaw/\$executeRaw ปลอดภัย)
+          - ไม่เกิน 15 ประเด็น หนึ่งประเด็นต่อหนึ่งจุดในโค้ด
+          - line = เลขบรรทัดในไฟล์เวอร์ชันใหม่ (HEAD) ที่ปัญหาอยู่ ต้องอยู่ในช่วงที่ comment ได้ด้านล่าง ถ้าปัญหาอยู่นอกช่วง ให้เลือกบรรทัดใน diff ที่เกี่ยวข้องที่สุด หรือใส่ path/line จริงไว้ (ระบบจะย้ายไปไว้ในสรุป)
+          - start_line (ไม่บังคับ) ใช้เมื่อปัญหาครอบหลายบรรทัด ต้องอยู่ใน hunk เดียวกับ line
+          - suggestion (ไม่บังคับ) = โค้ดใหม่ทั้งก้อนที่จะ "แทนที่" บรรทัด start_line..line ทุกบรรทัด พร้อม indent เดิม ใส่เฉพาะเมื่อมั่นใจและแก้ได้ในจุดนั้นจริง ไม่ต้องใส่ backticks
+
+          ช่วงบรรทัดที่ comment ได้ (ไฟล์: ช่วงบรรทัดใน HEAD):
+          ${RANGES}
+
+          ตอบกลับด้วย JSON เท่านั้นระหว่าง marker ด้านล่าง (ไม่มีข้อความอื่นนอก marker):
+          <<<FINDINGS_JSON
+          {"summary": "สรุป 2-3 บรรทัด", "findings": [{"path": "src/x.ts", "line": 42, "start_line": 40, "severity": "critical|high|medium|low", "title": "หัวข้อสั้น", "body": "ปัญหา ผลกระทบ วิธีแก้", "suggestion": "โค้ดแทนที่ (ไม่บังคับ)"}]}
+          FINDINGS_JSON>>>
+          PROMPT
+          echo "diff: $(wc -l < "$RUNNER_TEMP/pr.diff") lines"; echo "$RANGES"
+
+      - name: OpenCode review (JSON findings)
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 15
+        env:
+          # opencode-go provider reads OPENCODE_API_KEY. No GitHub token is given to the model step.
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+          OPENCODE_CONFIG_CONTENT: >-
+            {"$schema":"https://opencode.ai/config.json",
+             "permission":{"edit":"deny","webfetch":"deny",
+               "bash":{"*":"deny","git diff*":"allow","git show*":"allow","git log*":"allow"}}}
+        run: |
+          opencode run -m "$MODEL" -f "$RUNNER_TEMP/pr.diff" -- "$(cat "$RUNNER_TEMP/prompt.md")" \
+            | tee "$RUNNER_TEMP/opencode-output.txt"
+
+      - name: Post inline review
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/opencode_inline_review.py post "$RUNNER_TEMP/pr.diff" "$RUNNER_TEMP/opencode-output.txt"
+
+      # ---------- On demand (/oc comments): OpenCode's own GitHub agent replies in the thread ----------
+      - name: OpenCode (/oc command)
+        if: github.event_name != 'pull_request'
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          USE_GITHUB_TOKEN: "true"
+        run: opencode github run
