@@ -36,7 +36,8 @@ export class StockService {
     qty: number,
     user: string,
   ): Promise<{ moved: number }> {
-    if (qty == 0) throw new BadRequestException('qty must not be zero');
+    if (qty <= 0) throw new BadRequestException('qty must be positive');
+    if (fromWh === toWh) throw new BadRequestException('source and target warehouse must differ');
     const src = await this.prisma.$queryRawUnsafe<{ on_hand_qty: number }[]>(
       `SELECT on_hand_qty FROM stock_balance WHERE item_code = '${itemCode}' AND wh_code = '${fromWh}'`,
     );
