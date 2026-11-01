@@ -2,13 +2,16 @@ name: OpenCode PR Summary
 
 # Summary only (no review findings, no inline comments): when a PR has no real description,
 # OpenCode writes a short Thai summary (what the PR is about, main changes, risk areas) and posts
-# it as ONE PR comment. The PR body is never edited. OCR (ocr-review.yml) is the reviewer.
+# it as ONE sticky PR comment (updated in place). The PR body is never edited.
+# OCR (ocr-review.yml) is the reviewer.
 # Every trigger goes through the same gates (checked in the first step, against the live PR):
 #   body has < OPENCODE_SUMMARY_MIN_CHARS meaningful chars, diff not empty (changed_files > 0),
-#   no summary comment yet (posted once, never regenerated), OPENCODE_GO_API_KEY available.
+#   the existing summary (if any) is for an older head SHA, OPENCODE_GO_API_KEY available.
+# New commits refresh the summary (same comment, records the head SHA it reflects).
 # Triggers:
-#   opened / reopened / ready_for_review / synchronize -> non-draft PRs (drafts only if
-#       OPENCODE_SUMMARY_DRAFTS == 'true'), head branch not in the skip list
+#   opened / reopened / ready_for_review / synchronize -> non-draft PRs, head branch not in the
+#       skip list; drafts only when they carry OCR_TRIGGER_LABEL (in review) or
+#       OPENCODE_SUMMARY_DRAFTS == 'true' (WIP pushes to unlabeled drafts cost 0 minutes)
 #   edited                       -> only when the body changed
 #   labeled with OCR_TRIGGER_LABEL (ai-review) -> drafts too (same label that triggers OCR)
 #   workflow_dispatch(pr_number) -> drafts too
@@ -43,10 +46,10 @@ jobs:
          github.event.label.name == (vars.OCR_TRIGGER_LABEL || 'ai-review')) ||
         (github.event.action != 'labeled' &&
          (github.event.action != 'edited' || github.event.changes.body != null) &&
-         (github.event.action != 'synchronize' || !github.event.pull_request.body) &&
          !contains(format(',{0},', vars.AI_SKIP_HEAD_BRANCHES || 'main,develop'), format(',{0},', github.head_ref)) &&
          !(vars.AI_SKIP_HEAD_PREFIX != '-' && startsWith(github.head_ref, vars.AI_SKIP_HEAD_PREFIX || 'release/')) &&
-         (!github.event.pull_request.draft || vars.OPENCODE_SUMMARY_DRAFTS == 'true'))))
+         (!github.event.pull_request.draft || vars.OPENCODE_SUMMARY_DRAFTS == 'true' ||
+          contains(github.event.pull_request.labels.*.name, vars.OCR_TRIGGER_LABEL || 'ai-review')))))
     # API-bound work only: the 1-vCPU runner (15-minute job limit) bills at the slim rate.
     runs-on: ubuntu-slim
     timeout-minutes: 12
@@ -113,8 +116,9 @@ jobs:
               reason = 'OPENCODE_GO_API_KEY is not available (fork PR, or Dependabot without a Dependabot secret)'
           else:
               comments = get(f"{api}/issues/{pr_number}/comments?per_page=100")
-              if any(os.environ['MARKER'] in (c.get('body') or '') for c in comments):
-                  reason = 'summary already posted (it is never regenerated)'
+              tag = f"<!-- opencode-pr-summary-sha: {pr['head']['sha']} -->"
+              if any(tag in (c.get('body') or '') for c in comments):
+                  reason = 'summary is already up to date for this head SHA'
           print(f'skip: {reason}' if reason else 'summarize')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"run={'false' if reason else 'true'}\n")
@@ -218,9 +222,11 @@ jobs:
               print('::error::OpenCode returned no summary between the markers')
               sys.exit(1)
           marker = os.environ['MARKER']
-          body = (f"{marker}\n## 📝 สรุป PR อัตโนมัติ (OpenCode)\n"
-                  f"> PR นี้ยังไม่มี description จึงสรุปจาก diff ที่ `{os.environ['HEAD_SHA'][:7]}` "
-                  f"(สรุปอย่างเดียว ไม่ใช่การรีวิว) ถ้าเขียน description แล้ว comment นี้จะไม่ถูกอัปเดตอีก\n\n{text}\n")
+          sha = os.environ['HEAD_SHA']
+          body = (f"{marker}\n<!-- opencode-pr-summary-sha: {sha} -->\n## 📝 สรุป PR อัตโนมัติ (OpenCode)\n"
+                  f"> PR นี้ยังไม่มี description จึงสรุปจาก diff ถึง commit `{sha[:7]}` "
+                  f"(สรุปอย่างเดียว ไม่ใช่การรีวิว) comment นี้อัปเดตเองเมื่อมี commit ใหม่ "
+                  f"และหยุดอัปเดตเมื่อเขียน description แล้ว\n\n{text}\n")
 
           api = f"https://api.github.com/repos/{os.environ['REPO']}"
           hdr = {'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",

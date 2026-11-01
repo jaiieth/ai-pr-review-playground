@@ -52,26 +52,56 @@ on:
 permissions: {}
 
 jobs:
+  # OCR itself always reviews the WHOLE PR on ready_for_review / reopened (event_full_scope in
+  # open-code-review's post-review-comments.js). When the PR was already reviewed through the label,
+  # hand the ready event over to workflow_dispatch instead, so the checkpoint applies and only
+  # commits pushed since that review are reviewed (no-op when there are none).
+  # workflow_dispatch created with GITHUB_TOKEN is allowed to start a run.
+  ready-handoff:
+    if: >
+      github.event_name == 'pull_request' && github.event.action == 'ready_for_review' &&
+      contains(github.event.pull_request.labels.*.name, vars.OCR_TRIGGER_LABEL || 'ai-review')
+    runs-on: ubuntu-slim
+    timeout-minutes: 3
+    permissions:
+      actions: write   # create the workflow_dispatch event
+    steps:
+      - name: Dispatch checkpoint review
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: python3 {0}
+        run: |
+          import json, os, urllib.request
+          url = f"https://api.github.com/repos/{os.environ['REPO']}/actions/workflows/ocr-review.yml/dispatches"
+          data = json.dumps({'ref': os.environ['REF'], 'inputs': {'pr_number': os.environ['PR_NUMBER']}}).encode()
+          req = urllib.request.Request(url, data=data, method='POST', headers={
+              'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
+              'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
+          with urllib.request.urlopen(req, timeout=30) as r:
+              print(f"dispatched checkpoint review for PR #{os.environ['PR_NUMBER']} (HTTP {r.status})")
+
   ocr-review:
-    # Bot/agent PRs ARE reviewed (no actor/sender filter).
-    # pull_request skips (job never starts = 0 billable minutes):
-    #   - "labeled" events for any label other than OCR_TRIGGER_LABEL
-    #   - head branch in AI_SKIP_HEAD_BRANCHES or starting with AI_SKIP_HEAD_PREFIX (release / sync PRs).
-    #     Task PRs branch-x -> main ARE reviewed.
-    #   - drafts, unless OCR_REVIEW_DRAFTS == 'true' or the PR carries OCR_TRIGGER_LABEL
-    # workflow_dispatch always runs for the given PR number.
+    # Bot/agent PRs ARE reviewed (no actor/sender filter). Skipped jobs never start (0 minutes).
     # Triggers:
-    #   workflow_dispatch(pr_number)            -> always (drafts too)
+    #   workflow_dispatch(pr_number)            -> always (drafts too; checkpoint unless full_review)
     #   labeled with OCR_TRIGGER_LABEL          -> always (drafts too, skip list ignored: explicit request);
     #                                              remove + re-add the label to run again
-    #   ready_for_review                        -> always (checkpoint: only commits not yet reviewed)
+    #   ready_for_review                        -> PR never label-reviewed: full review here;
+    #                                              PR carries the label: ready-handoff above (checkpoint)
     #   opened / reopened / synchronize         -> non-draft PRs (drafts only if OCR_REVIEW_DRAFTS == 'true'),
     #                                              head branch not in the skip list
+    #   head branch in AI_SKIP_HEAD_BRANCHES / starting with AI_SKIP_HEAD_PREFIX = release / sync PRs
+    #   (skipped). Task PRs branch-x -> main ARE reviewed.
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
        github.event.label.name == (vars.OCR_TRIGGER_LABEL || 'ai-review')) ||
       (github.event_name == 'pull_request' && github.event.action != 'labeled' &&
+       (github.event.action != 'ready_for_review' ||
+        !contains(github.event.pull_request.labels.*.name, vars.OCR_TRIGGER_LABEL || 'ai-review')) &&
        !contains(format(',{0},', vars.AI_SKIP_HEAD_BRANCHES || 'main,develop'), format(',{0},', github.head_ref)) &&
        !(vars.AI_SKIP_HEAD_PREFIX != '-' && startsWith(github.head_ref, vars.AI_SKIP_HEAD_PREFIX || 'release/')) &&
        (!github.event.pull_request.draft || vars.OCR_REVIEW_DRAFTS == 'true'))
