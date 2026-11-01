@@ -1,0 +1,78 @@
+name: PR Agent
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  pr_agent_job:
+    # Bot/agent PRs ARE reviewed (no sender.type filter).
+    # Loop safety: PR-Agent comments with GITHUB_TOKEN (github-actions[bot]); GitHub does not
+    # start new workflow runs for issue_comment events created by GITHUB_TOKEN, and PR-Agent's
+    # runner also drops comment events whose sender is a Bot. PR-Agent never pushes commits.
+    # Skips: comments on plain issues, draft PRs (reviewed on ready_for_review),
+    # and the main <-> develop sync PRs that CI also skips.
+    # PR comments (/review, /ask, /improve ...) only from people with write access: on a public
+    # repo anyone can comment, and issue_comment runs with the repo secrets (cost abuse).
+    if: >
+      (github.event_name == 'pull_request' ||
+        (github.event.issue.pull_request &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))) &&
+      !(github.event_name == 'pull_request' && github.event.pull_request.draft) &&
+      !(github.event_name == 'pull_request' &&
+        ((github.event.pull_request.head.ref == 'main' && github.event.pull_request.base.ref == 'develop') ||
+         (github.event.pull_request.head.ref == 'develop' && github.event.pull_request.base.ref == 'main')))
+    runs-on: ubuntu-latest
+    # Job-level so skipped runs (bots, non-PR comments) never cancel a running review
+    concurrency:
+      group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: PR Agent (OpenCode Go / DeepSeek V4.1 Flash)
+        # the-pr-agent/pr-agent v0.49.0
+        uses: the-pr-agent/pr-agent@efdde4afe14aa401a3889012c7f3e9ef3081a430 # v0.49.0 (verified via git ls-remote, 2026-11-01)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # OpenCode Go key (oc_sk_...) from the Go-subscribed workspace
+          OPENAI_KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+
+          # Host-only settings (ignored if put in .pr_agent.toml)
+          OPENAI.API_BASE: "https://opencode.ai/inference/go/openai/v1"
+          LITELLM.EXTRA_HEADERS: >-
+            {"User-Agent": "erp-api-pr-agent/0.49.0",
+             "x-opencode-session": "ses_erp-api-pr-${{ github.event.pull_request.number || github.event.issue.number }}"}
+
+          # Model (kept here so the repo-level .pr_agent.toml can't switch endpoint/model)
+          # Override with repo variable PR_AGENT_MODEL (OpenCode Go model id, without the openai/ prefix)
+          CONFIG.MODEL: ${{ format('openai/{0}', vars.PR_AGENT_MODEL || 'deepseek-v4.1-flash') }}
+          CONFIG.FALLBACK_MODELS: '[]'
+          CONFIG.CUSTOM_MODEL_MAX_TOKENS: "128000"
+          CONFIG.MAX_MODEL_TOKENS: "128000"
+
+          # Which tools run automatically on PR open/update
+          GITHUB_ACTION_CONFIG.AUTO_REVIEW: "true"
+          GITHUB_ACTION_CONFIG.AUTO_DESCRIBE: "false"
+          # off: benchmark showed /improve mostly repeats /review + OCR inline comments; run `/improve` on demand
+          GITHUB_ACTION_CONFIG.AUTO_IMPROVE: "false"
+          GITHUB_ACTION_CONFIG.PR_ACTIONS: '["opened", "reopened", "ready_for_review"]'
+          # New pushes to an open PR: re-run /review only (updates the same comment)
+          GITHUB_ACTION_CONFIG.HANDLE_PUSH_TRIGGER: "true"
+          GITHUB_ACTION_CONFIG.PUSH_COMMANDS: '["/review"]'
+
+          # Review bot/agent PRs and bot/agent pushes too (defaults skip them)
+          GITHUB.IGNORE_BOT_PR: "false"
+          GITHUB_APP.IGNORE_BOT_PR: "false"
+          GITHUB_ACTION_CONFIG.PUSH_TRIGGER_IGNORE_BOT_COMMITS: "false"
+          # Default ignore_pr_title ("^[Auto]", "^Auto") would skip many bot PR titles
+          CONFIG.IGNORE_PR_TITLE: '[]'
+          CONFIG.IGNORE_PR_AUTHORS: '[]'

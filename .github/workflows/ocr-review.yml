@@ -1,0 +1,188 @@
+name: OCR Review
+
+# Alibaba open-code-review (OCR) v1.13.3 via the OpenCode Go subscription.
+# Required secret: OPENCODE_GO_API_KEY (oc_sk_... from the Go-subscribed workspace).
+# Optional repo variables (Settings > Secrets and variables > Actions > Variables):
+#   OCR_MODEL     default deepseek-v4.1-flash   (supported: deepseek-*, glm-5.3-flash)
+#   OCR_PROTOCOL  default openai                (openai | anthropic)
+#   OCR_THINKING  default off                   (off | on)
+# Review rules / ignore paths: .opencodereview/rule.json (OCR's project rule layer).
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to review
+        required: true
+        type: string
+      model:
+        description: Model override (empty = repo var OCR_MODEL)
+        required: false
+        type: string
+        default: ''
+      protocol:
+        description: Protocol override
+        required: false
+        type: choice
+        options: [repo-var, openai, anthropic]
+        default: repo-var
+      thinking:
+        description: Thinking override
+        required: false
+        type: choice
+        options: [repo-var, 'off', 'on']
+        default: repo-var
+
+permissions: {}
+
+jobs:
+  ocr-review:
+    # Bot/agent PRs ARE reviewed (no actor/sender filter).
+    # Skips (pull_request only): drafts (reviewed on ready_for_review) and main <-> develop sync PRs.
+    # workflow_dispatch always runs for the given PR number.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (!github.event.pull_request.draft &&
+       !((github.event.pull_request.head.ref == 'main' && github.event.pull_request.base.ref == 'develop') ||
+         (github.event.pull_request.head.ref == 'develop' && github.event.pull_request.base.ref == 'main')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Job-level so skipped runs never enter (or cancel) the group.
+    concurrency:
+      group: ocr-review-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read        # checkout + git fetch of base / PR head
+      pull-requests: write  # inline review comments + sticky summary comment
+    steps:
+      - name: Check secret
+        env:
+          KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::OPENCODE_GO_API_KEY is not available to this run. Fork PRs never get secrets; Dependabot PRs read Dependabot secrets, so add the key there too if Dependabot PRs should be reviewed."
+            exit 1
+          fi
+
+      - name: Resolve PR (workflow_dispatch)
+        id: pr
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::pr_number must be a positive integer (got '$PR_NUMBER')"
+            exit 1
+          fi
+          read -r STATE BASE_REF HEAD_SHA < <(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+            --jq '[.state, .base.ref, .head.sha] | @tsv')
+          if [ "$STATE" != "open" ]; then
+            echo "::error::PR #${PR_NUMBER} is ${STATE}, not open"
+            exit 1
+          fi
+          {
+            echo "pr_number=${PR_NUMBER}"
+            echo "base_ref=${BASE_REF}"
+            echo "head_sha=${HEAD_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Map model / protocol / thinking to OCR inputs
+        id: llm
+        env:
+          IN_MODEL: ${{ inputs.model }}
+          IN_PROTOCOL: ${{ inputs.protocol }}
+          IN_THINKING: ${{ inputs.thinking }}
+          VAR_MODEL: ${{ vars.OCR_MODEL }}
+          VAR_PROTOCOL: ${{ vars.OCR_PROTOCOL }}
+          VAR_THINKING: ${{ vars.OCR_THINKING }}
+        run: |
+          pick() { # dispatch override > repo var > default
+            local in="$1" var="$2" def="$3"
+            if [ -n "$in" ] && [ "$in" != "repo-var" ]; then echo "$in"
+            elif [ -n "$var" ]; then echo "$var"
+            else echo "$def"; fi
+          }
+          MODEL="$(pick "$IN_MODEL" "$VAR_MODEL" deepseek-v4.1-flash | tr '[:upper:]' '[:lower:]')"
+          PROTOCOL="$(pick "$IN_PROTOCOL" "$VAR_PROTOCOL" openai | tr '[:upper:]' '[:lower:]')"
+          THINKING="$(pick "$IN_THINKING" "$VAR_THINKING" off | tr '[:upper:]' '[:lower:]')"
+
+          if [[ ! "$MODEL" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::Invalid model id '$MODEL'"; exit 1
+          fi
+          case "$THINKING" in off|on) ;; *)
+            echo "::error::OCR_THINKING must be off or on (got '$THINKING')"; exit 1 ;;
+          esac
+
+          # GLM-5.3-Flash cannot run with thinking off: force on, effort low.
+          if [ "$MODEL" = "glm-5.3-flash" ] && [ "$THINKING" = "off" ]; then
+            echo "::warning::glm-5.3-flash always thinks; using thinking=on (openai: effort low, anthropic: budget_tokens 8000)"
+            THINKING=on
+          fi
+
+          # Never use effort max: OCR caps completion tokens at 16384 (issue #1532).
+          case "$PROTOCOL" in
+            openai)
+              URL="https://opencode.ai/inference/go/openai/v1"   # OCR appends /chat/completions
+              USE_ANTHROPIC=false
+              case "$MODEL:$THINKING" in
+                deepseek-*:off)
+                  EXTRA_BODY='{"thinking":{"type":"disabled"}}'; EFFORT='' ;;
+                deepseek-*:on|glm-5.3-flash:on)
+                  EXTRA_BODY='{"thinking":{"type":"enabled"}}'; EFFORT=low ;;
+                *)
+                  echo "::error::Unsupported model '$MODEL' (thinking=$THINKING) on openai. Supported: deepseek-*, glm-5.3-flash"; exit 1 ;;
+              esac
+              ;;
+            anthropic)
+              URL="https://opencode.ai/inference/go/anthropic"   # OCR appends /v1/messages
+              USE_ANTHROPIC=true
+              EFFORT=''   # llm_reasoning_effort is rejected by OCR on the Anthropic protocol
+              case "$MODEL:$THINKING" in
+                deepseek-*:off)
+                  EXTRA_BODY='{"thinking":{"type":"disabled"}}' ;;
+                # budget_tokens must stay below OCR's 16384 completion cap or thinking is dropped.
+                # Live-tested 2026-11-01 on Go: thinking replay (empty signature) returns 200.
+                deepseek-*:on|glm-5.3-flash:on)
+                  EXTRA_BODY='{"thinking":{"type":"enabled","budget_tokens":8000}}' ;;
+                *)
+                  echo "::error::Unsupported on anthropic: model '$MODEL' with thinking=$THINKING. Supported: deepseek-* (off|on), glm-5.3-flash (on)."; exit 1 ;;
+              esac
+              ;;
+            *)
+              echo "::error::OCR_PROTOCOL must be openai or anthropic (got '$PROTOCOL')"; exit 1 ;;
+          esac
+
+          echo "OCR config: model=$MODEL protocol=$PROTOCOL thinking=$THINKING effort=${EFFORT:-<none>} url=$URL extra_body=$EXTRA_BODY"
+          {
+            echo "model=$MODEL"
+            echo "protocol=$PROTOCOL"
+            echo "url=$URL"
+            echo "use_anthropic=$USE_ANTHROPIC"
+            echo "extra_body=$EXTRA_BODY"
+            echo "effort=$EFFORT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: OpenCodeReview
+        # alibaba/open-code-review v1.13.3 (annotated tag dd92520 -> commit 375f64c)
+        uses: alibaba/open-code-review@375f64cd6f67a48a135da83cfcf59c52669a09cb
+        with:
+          ocr_version: '1.13.3'
+          llm_url: ${{ steps.llm.outputs.url }}
+          llm_auth_token: ${{ secrets.OPENCODE_GO_API_KEY }}
+          llm_model: ${{ steps.llm.outputs.model }}
+          llm_protocol: ${{ steps.llm.outputs.protocol }}
+          llm_use_anthropic: ${{ steps.llm.outputs.use_anthropic }}
+          llm_extra_body: ${{ steps.llm.outputs.extra_body }}
+          llm_reasoning_effort: ${{ steps.llm.outputs.effort }}
+          # OCR already sends its own User-Agent (open-code-review/1.13.3); User-Agent is a
+          # reserved header in OCR and would be rejected here. Session ID for Go routing/caching:
+          llm_extra_headers: 'x-opencode-session={ocr_session_key}'
+          language: Thai
+          # Empty on pull_request (the action reads the event); set on workflow_dispatch.
+          pr_number: ${{ steps.pr.outputs.pr_number }}
+          base_ref: ${{ steps.pr.outputs.base_ref }}
+          head_sha: ${{ steps.pr.outputs.head_sha }}
+          upload_artifacts: 'true'
