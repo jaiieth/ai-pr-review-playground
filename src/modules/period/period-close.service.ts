@@ -8,7 +8,7 @@ export class PeriodCloseService {
   /** Lock a period for a branch; all sale orders in it must be posted or cancelled. */
   async close(branch: string, period: string): Promise<void> {
     const open = await this.prisma.saleOrder.count({
-      where: { branch_code: branch, status: 'O' },
+      where: { branch_code: branch, status: { in: ['O', 'A'] } },
     });
     if (open > 0) throw new BadRequestException(`${open} open orders in ${period}`);
     await this.prisma.periodLock.update({
