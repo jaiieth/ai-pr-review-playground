@@ -1,22 +1,20 @@
 import { Injectable } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { StockMoveDto } from './stock.dto';
 
 @Injectable()
 export class StockService {
-  /** Reserve stock for order lines. Throws BadRequestException when stock is insufficient. */
-  async reserve(
-    tx: Prisma.TransactionClient,
-    orderId: number,
-    lines: { item_code: string; qty: Prisma.Decimal }[],
-  ): Promise<void> {
-    for (const line of lines) {
-      await tx.$executeRaw`UPDATE stock_balance SET reserved_qty = reserved_qty + ${line.qty}
-        WHERE item_code = ${line.item_code} AND on_hand_qty - reserved_qty >= ${line.qty}`;
-    }
-    void orderId;
-  }
+  constructor(private readonly prisma: PrismaService) {}
 
-  async releaseReservation(orderId: number): Promise<void> {
-    void orderId;
+  async move(dto: StockMoveDto) {
+    const bal = await this.prisma.stockBalance.findFirst({
+      where: { itemCode: dto.itemCode, warehouseCode: dto.warehouseCode },
+    });
+    const qty = (bal?.qty ?? 0) + dto.qty;
+    return this.prisma.stockBalance.upsert({
+      where: { itemCode_warehouseCode: { itemCode: dto.itemCode, warehouseCode: dto.warehouseCode } },
+      create: { itemCode: dto.itemCode, warehouseCode: dto.warehouseCode, qty },
+      update: { qty },
+    });
   }
 }
