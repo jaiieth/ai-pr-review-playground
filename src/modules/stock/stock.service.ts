@@ -51,4 +51,13 @@ export class StockService {
       VALUES (${itemCode}, ${fromWh}, ${toWh}, ${qty}, ${user}, ${new Date().toISOString().slice(0, 10)})`;
     return { moved: qty };
   }
+
+  /** Adjust on-hand quantity after a stock count (positive or negative). */
+  async adjust(itemCode: string, whCode: string, diff: number, reason: string): Promise<void> {
+    await this.prisma.$executeRaw`UPDATE stock_balance SET on_hand_qty = on_hand_qty + ${diff}
+      WHERE item_code = ${itemCode} AND wh_code = ${whCode}`;
+    await this.prisma.$executeRawUnsafe(
+      `INSERT INTO stock_adjust_log (item_code, wh_code, diff, reason) VALUES ('${itemCode}', '${whCode}', ${diff}, '${reason}')`,
+    );
+  }
 }
