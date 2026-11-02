@@ -2,7 +2,7 @@ name: OCR Review
 
 # The only automatic reviewer: Alibaba open-code-review (OCR) v1.13.3 via the OpenCode Go subscription.
 # Credential: repo var OPENCODE_CLIENT_ID = OpenCode service-account credential (GitHub OIDC, 1-hour token,
-#   no stored key; pull_request events only). Without it: secret OPENCODE_GO_API_KEY (oc_sk_... from the
+#   no stored key; pull_request events only). Without it, or if its sign-in fails: secret OPENCODE_GO_API_KEY (oc_sk_... from the
 #   Go-subscribed workspace). See 'Sign in to OpenCode'. Only pull_request events (no workflow_dispatch).
 # Optional repo variables (Settings > Secrets and variables > Actions > Variables):
 #   OCR_MODEL              default deepseek-v4.1-flash   (supported: deepseek-*, glm-5.3-flash)
@@ -61,44 +61,56 @@ jobs:
       - name: Sign in to OpenCode
         # vars.OPENCODE_CLIENT_ID set -> OpenCode service-account token via GitHub OIDC (1 hour; the
         # console credential trusts pull_request workflows of this repo; fork PRs get no OIDC token).
-        # Not set -> secrets.OPENCODE_GO_API_KEY. Exported as env OPENCODE_API_KEY for later steps.
+        # Not set, or the OIDC sign-in fails -> secrets.OPENCODE_GO_API_KEY (with a warning when
+        # OPENCODE_CLIENT_ID was set). Exported as env OPENCODE_API_KEY for later steps.
         id: auth
         env:
           CLIENT_ID: ${{ vars.OPENCODE_CLIENT_ID }}
-          KEY: ${{ vars.OPENCODE_CLIENT_ID == '' && secrets.OPENCODE_GO_API_KEY || '' }}
+          KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
         run: |
           set -uo pipefail
           # Never prints the OIDC token, the OpenCode token or the key (masked before use).
+          token=''
+          failure=''
           if [ -n "$CLIENT_ID" ]; then
             if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-              echo "::error::No GitHub OIDC token in this run (fork PR, or the job lacks id-token: write)"
-              exit 1
-            fi
-            # Same calls as the OpenCode console snippet.
-            oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://opencode.ai/console" | jq -r '.value // empty') || oidc=''
-            [ -n "$oidc" ] && echo "::add-mask::$oidc"
-            resp=$(mktemp)
-            status=$(curl -sS -o "$resp" -w '%{http_code}' -X POST https://opencode.ai/console/auth/oauth/token \
-              -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
-              -d "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
-              -d "client_id=$CLIENT_ID" \
-              -d "subject_token=$oidc") || status=000
-            token=$(jq -r '.access_token // empty' "$resp" 2>/dev/null) || token=''
-            if [ -z "$token" ]; then
-              echo "::error::OpenCode token exchange failed (HTTP $status): $(jq -c '{error, error_description}' "$resp" 2>/dev/null || echo 'non-JSON response'). Check the OPENCODE_CLIENT_ID credential in the OpenCode console (it must trust pull_request workflows of ${GITHUB_REPOSITORY})."
+              failure="no GitHub OIDC token in this run (fork PR, or the job lacks id-token: write)"
+            else
+              # Same calls as the OpenCode console snippet.
+              oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://opencode.ai/console" | jq -r '.value // empty') || oidc=''
+              [ -n "$oidc" ] && echo "::add-mask::$oidc"
+              resp=$(mktemp)
+              status=$(curl -sS -o "$resp" -w '%{http_code}' -X POST https://opencode.ai/console/auth/oauth/token \
+                -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+                -d "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+                -d "client_id=$CLIENT_ID" \
+                -d "subject_token=$oidc") || status=000
+              token=$(jq -r '.access_token // empty' "$resp" 2>/dev/null) || token=''
+              if [ -n "$token" ]; then
+                echo "::add-mask::$token"
+                echo "OpenCode sign-in: service-account token (HTTP $status, expires in $(jq -r '.expires_in // "?"' "$resp")s)"
+              else
+                failure="OpenCode token exchange failed (HTTP $status): $(jq -c '{error, error_description}' "$resp" 2>/dev/null || echo 'non-JSON response'). Check the OPENCODE_CLIENT_ID credential in the OpenCode console (it must trust pull_request workflows of ${GITHUB_REPOSITORY})"
+              fi
               rm -f "$resp"
+            fi
+          fi
+          if [ -z "$token" ]; then
+            if [ -n "$KEY" ]; then
+              echo "::add-mask::$KEY"
+              token=$KEY
+              if [ -n "$failure" ]; then
+                echo "::warning::OIDC sign-in failed: $failure. Fell back to secrets.OPENCODE_GO_API_KEY."
+              fi
+              echo "OpenCode sign-in: secrets.OPENCODE_GO_API_KEY"
+            elif [ -n "$failure" ]; then
+              echo "::error::$failure. No fallback: secret OPENCODE_GO_API_KEY is not set."
+              exit 1
+            else
+              echo "::error::No OpenCode credential: set repo var OPENCODE_CLIENT_ID (service account) or secret OPENCODE_GO_API_KEY. Fork PRs never get secrets; Dependabot PRs read Dependabot secrets."
               exit 1
             fi
-            echo "::add-mask::$token"
-            echo "OpenCode sign-in: service-account token (HTTP $status, expires in $(jq -r '.expires_in // "?"' "$resp")s)"
-            rm -f "$resp"
-          elif [ -n "$KEY" ]; then
-            token=$KEY
-            echo "OpenCode sign-in: secrets.OPENCODE_GO_API_KEY"
-          else
-            echo "::error::No OpenCode credential: set repo var OPENCODE_CLIENT_ID (service account) or secret OPENCODE_GO_API_KEY. Fork PRs never get secrets; Dependabot PRs read Dependabot secrets."
-            exit 1
           fi
           echo "OPENCODE_API_KEY=$token" >> "$GITHUB_ENV"
 

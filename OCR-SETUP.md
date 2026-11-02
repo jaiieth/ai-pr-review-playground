@@ -20,6 +20,7 @@ PR-Agent ถูกถอดออกแล้ว (`pr-agent.yml`, `.pr_agent.tom
 2. **GitHub repo erp-api** › Settings › Secrets and variables › Actions
    - Variable `OPENCODE_CLIENT_ID` = client id ของ service account (ตั้งแล้ว = ใช้ token เสมอ ไม่อ่าน secret) **หรือ** Secret `OPENCODE_GO_API_KEY` = key `oc_sk_...` (ใช้เมื่อไม่ได้ตั้ง `OPENCODE_CLIENT_ID`; ถ้าจะให้รีวิว PR ของ Dependabot ต้องใส่ชื่อเดียวกันใน **Dependabot secrets** ด้วย)
    - PR จาก fork ไม่ได้ทั้ง OIDC token และ secret → OCR fail ที่ "Sign in to OpenCode", summary ข้าม
+   - **fallback:** ถ้าตั้ง `OPENCODE_CLIENT_ID` แต่แลก token ไม่สำเร็จ (หรือไม่มี OIDC token) จะขึ้น `::warning::` บอก HTTP status + `error`/`error_description` แล้วใช้ secret `OPENCODE_GO_API_KEY` แทน fail เฉพาะเมื่อไม่มีทั้ง 2 ทาง (ตอนนี้ repo private ใน org `Siamrajathanee-SO` แลก token ได้ `400 invalid_grant` ทั้งที่ credential ตั้งขอบเขต Pull requests ของ repo ถูกต้อง และ `sub` รูปแบบเดียวกับ playground ที่ใช้ได้ คาดว่าเป็นข้อจำกัดฝั่ง OpenCode กับ repo private ใน org จึงควรใส่ secret ไว้ด้วย)
    - Variables: ไม่ต้องใส่ก็ได้ ทุกตัวมี default (ตารางด้านล่าง) ถ้าเคยตั้ง `PR_AGENT_MODEL` ไว้ให้ลบทิ้ง
 3. สร้าง label `ai-review` (Issues › Labels › New label) ถ้าจะใช้สั่งรีวิว draft
 4. Settings › Actions › General: อนุญาตให้รัน Actions ได้ (และ Workflow permissions แบบ read ก็พอ เพราะแต่ละ job ขอ `pull-requests: write` เอง)
