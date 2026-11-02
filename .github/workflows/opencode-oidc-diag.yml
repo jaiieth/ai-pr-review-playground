@@ -1,6 +1,6 @@
 name: OpenCode OIDC diagnostic
 
-# Manual diagnostic: exchange a GitHub OIDC token for an OpenCode service-account token,
+# Manual diagnostic (playground only): exchange a GitHub OIDC token for an OpenCode service-account token,
 # then make tiny requests to the OpenCode Go endpoints. Never prints any token or key:
 # only HTTP status codes and non-secret response fields.
 on:
@@ -29,17 +29,33 @@ jobs:
         run: |
           import base64, json, os, sys, urllib.error, urllib.parse, urllib.request
 
-          def call(req):
-              try:
-                  with urllib.request.urlopen(req, timeout=30) as r:
-                      return r.status, r.read(), dict(r.headers)
-              except urllib.error.HTTPError as e:
-                  return e.code, e.read(), dict(e.headers)
+          def call(url, data=None, headers=None):
+              # real curl (Cloudflare in front of opencode.ai rejects the Python-urllib signature: error 1010).
+              # Headers and body go through files/stdin so no credential appears on a command line.
+              import subprocess, tempfile
+              with tempfile.TemporaryDirectory() as d:
+                  hf, bf, rf = f'{d}/h', f'{d}/b', f'{d}/resp'
+                  with open(hf, 'w') as f:
+                      f.write(''.join(f'{k}: {v}\n' for k, v in (headers or {}).items()))
+                  cmd = ['curl', '-sS', '-o', bf, '-D', rf, '-w', '%{http_code}', '-H', f'@{hf}', url]
+                  if data is not None:
+                      cmd += ['--data-binary', '@-']
+                  p = subprocess.run(cmd, input=data, capture_output=True)
+                  if p.returncode:
+                      print('curl error:', p.stderr.decode(errors='replace')[:300])
+                  body = open(bf, 'rb').read() if os.path.exists(bf) else b''
+                  hdr = {}
+                  if os.path.exists(rf):
+                      for line in open(rf, errors='replace').read().replace('\r', '').strip().split('\n\n')[-1].splitlines()[1:]:
+                          if ':' in line:
+                              k, v = line.split(':', 1)
+                              hdr[k.strip()] = v.strip()
+                  return int(p.stdout or 0), body, hdr
 
           if not os.environ.get('CLIENT_ID'):
               sys.exit('::error::vars.OPENCODE_CLIENT_ID is not set')
           url = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=' + urllib.parse.quote(os.environ['AUDIENCE'], safe='')
-          st, body, _ = call(urllib.request.Request(url, headers={'Authorization': 'bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']}))
+          st, body, _ = call(url, headers={'Authorization': 'bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
           print(f'GitHub OIDC request: HTTP {st}')
           if st != 200:
               sys.exit(1)
@@ -54,8 +70,8 @@ jobs:
               'client_id': os.environ['CLIENT_ID'],
               'subject_token': oidc,
           }).encode()
-          st, body, hdr = call(urllib.request.Request('https://opencode.ai/console/auth/oauth/token', data=data,
-                                                      headers={'Content-Type': 'application/x-www-form-urlencoded'}))
+          st, body, hdr = call('https://opencode.ai/console/auth/oauth/token', data=data,
+                               headers={'Content-Type': 'application/x-www-form-urlencoded'})
           print(f'OpenCode token exchange: HTTP {st}, content-type {hdr.get("Content-Type")}')
           try:
               j = json.loads(body)
@@ -80,14 +96,35 @@ jobs:
         run: |
           import json, os, urllib.error, urllib.request
 
+          def call_raw(url, data=None, headers=None):
+              # real curl (Cloudflare in front of opencode.ai rejects the Python-urllib signature: error 1010).
+              # Headers and body go through files/stdin so no credential appears on a command line.
+              import subprocess, tempfile
+              with tempfile.TemporaryDirectory() as d:
+                  hf, bf, rf = f'{d}/h', f'{d}/b', f'{d}/resp'
+                  with open(hf, 'w') as f:
+                      f.write(''.join(f'{k}: {v}\n' for k, v in (headers or {}).items()))
+                  cmd = ['curl', '-sS', '-o', bf, '-D', rf, '-w', '%{http_code}', '-H', f'@{hf}', url]
+                  if data is not None:
+                      cmd += ['--data-binary', '@-']
+                  p = subprocess.run(cmd, input=data, capture_output=True)
+                  if p.returncode:
+                      print('curl error:', p.stderr.decode(errors='replace')[:300])
+                  body = open(bf, 'rb').read() if os.path.exists(bf) else b''
+                  hdr = {}
+                  if os.path.exists(rf):
+                      for line in open(rf, errors='replace').read().replace('\r', '').strip().split('\n\n')[-1].splitlines()[1:]:
+                          if ':' in line:
+                              k, v = line.split(':', 1)
+                              hdr[k.strip()] = v.strip()
+                  return int(p.stdout or 0), body, hdr
+
           def call(url, payload, headers):
-              req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                           headers={'Content-Type': 'application/json', **headers})
-              try:
-                  with urllib.request.urlopen(req, timeout=60) as r:
-                      return r.status, r.read(), dict(r.headers)
-              except urllib.error.HTTPError as e:
-                  return e.code, e.read(), dict(e.headers)
+              # Go asks clients to send their own user agent and a stable x-opencode-session per conversation
+              # (https://opencode.ai/v2/docs/console/go/#where-can-i-use-it)
+              base = {'Content-Type': 'application/json', 'User-Agent': 'ai-pr-review-oidc-diag/1.0',
+                      'x-opencode-session': 'oidc-diag-' + os.environ.get('GITHUB_RUN_ID', '0')}
+              return call_raw(url, json.dumps(payload).encode(), {**base, **headers})
 
           def report(name, st, body, hdr):
               print(f'\n== {name}: HTTP {st}')
@@ -100,7 +137,7 @@ jobs:
               except Exception:
                   print('non-JSON body (first 300 chars):', body[:300].decode(errors='replace'))
                   return
-              out = {k: j.get(k) for k in ('id', 'model', 'usage', 'stop_reason', 'cost', 'provider') if k in j}
+              out = {k: j.get(k) for k in ('id', 'model', 'usage', 'stop_reason', 'cost', 'provider', 'opencode') if k in j}
               if 'choices' in j:
                   out['finish_reason'] = j['choices'][0].get('finish_reason')
                   out['text'] = (j['choices'][0].get('message') or {}).get('content', '')[:40]
