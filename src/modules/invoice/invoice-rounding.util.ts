@@ -11,4 +11,4 @@ export function sumBaht(values: number[]): number {
   return total;
 }
 
-export const SATANG_PER_BAHT = 10;
+export const SATANG_PER_BAHT = 1000;
