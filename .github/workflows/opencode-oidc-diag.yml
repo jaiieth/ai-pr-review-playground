@@ -1,0 +1,126 @@
+name: OpenCode OIDC diagnostic
+
+# Manual diagnostic: exchange a GitHub OIDC token for an OpenCode service-account token,
+# then make tiny requests to the OpenCode Go endpoints. Never prints any token or key:
+# only HTTP status codes and non-secret response fields.
+on:
+  workflow_dispatch:
+    inputs:
+      compare_secret:
+        description: Also ping the Go anthropic endpoint with secrets.OPENCODE_GO_API_KEY for comparison
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  diag:
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Sign in to OpenCode (OIDC token exchange)
+        env:
+          AUDIENCE: https://opencode.ai/console
+          CLIENT_ID: ${{ vars.OPENCODE_CLIENT_ID }}
+        shell: python3 {0}
+        run: |
+          import base64, json, os, sys, urllib.error, urllib.parse, urllib.request
+
+          def call(req):
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return r.status, r.read(), dict(r.headers)
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read(), dict(e.headers)
+
+          if not os.environ.get('CLIENT_ID'):
+              sys.exit('::error::vars.OPENCODE_CLIENT_ID is not set')
+          url = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=' + urllib.parse.quote(os.environ['AUDIENCE'], safe='')
+          st, body, _ = call(urllib.request.Request(url, headers={'Authorization': 'bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']}))
+          print(f'GitHub OIDC request: HTTP {st}')
+          if st != 200:
+              sys.exit(1)
+          oidc = json.loads(body)['value']
+          print('::add-mask::' + oidc)
+          claims = json.loads(base64.urlsafe_b64decode(oidc.split('.')[1] + '=='))
+          print('OIDC claims (non-secret):', json.dumps({k: claims.get(k) for k in ('iss', 'aud', 'sub', 'repository', 'ref', 'event_name', 'job_workflow_ref')}))
+
+          data = urllib.parse.urlencode({
+              'grant_type': 'urn:ietf:params:oauth:grant-type:token-exchange',
+              'subject_token_type': 'urn:ietf:params:oauth:token-type:jwt',
+              'client_id': os.environ['CLIENT_ID'],
+              'subject_token': oidc,
+          }).encode()
+          st, body, hdr = call(urllib.request.Request('https://opencode.ai/console/auth/oauth/token', data=data,
+                                                      headers={'Content-Type': 'application/x-www-form-urlencoded'}))
+          print(f'OpenCode token exchange: HTTP {st}, content-type {hdr.get("Content-Type")}')
+          try:
+              j = json.loads(body)
+          except Exception:
+              print('non-JSON body (first 300 chars):', body[:300].decode(errors='replace'))
+              sys.exit(1)
+          tok = j.get('access_token') if isinstance(j, dict) else None
+          if tok:
+              print('::add-mask::' + tok)
+          safe = {k: v for k, v in j.items() if k not in ('access_token', 'refresh_token', 'id_token')} if isinstance(j, dict) else j
+          print('exchange response fields (secrets removed):', json.dumps(safe)[:600])
+          if not tok:
+              sys.exit('::error::no access_token in exchange response')
+          print(f'access_token: present, length {len(tok)}, looks like JWT: {tok.count(".") == 2}')
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'OPENCODE_API_KEY={tok}\n')
+
+      - name: Ping OpenCode Go endpoints
+        env:
+          GO_KEY: ${{ inputs.compare_secret && secrets.OPENCODE_GO_API_KEY || '' }}
+        shell: python3 {0}
+        run: |
+          import json, os, urllib.error, urllib.request
+
+          def call(url, payload, headers):
+              req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                           headers={'Content-Type': 'application/json', **headers})
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return r.status, r.read(), dict(r.headers)
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read(), dict(e.headers)
+
+          def report(name, st, body, hdr):
+              print(f'\n== {name}: HTTP {st}')
+              # response headers are server-set, never contain our credentials; drop cookies anyway
+              keep = {k: v for k, v in hdr.items() if k.lower() not in ('set-cookie', 'cookie', 'authorization')
+                      and (k.lower().startswith('x-') or k.lower() in ('content-type', 'server', 'cf-ray', 'openai-model'))}
+              print('response headers:', json.dumps(keep))
+              try:
+                  j = json.loads(body)
+              except Exception:
+                  print('non-JSON body (first 300 chars):', body[:300].decode(errors='replace'))
+                  return
+              out = {k: j.get(k) for k in ('id', 'model', 'usage', 'stop_reason', 'cost', 'provider') if k in j}
+              if 'choices' in j:
+                  out['finish_reason'] = j['choices'][0].get('finish_reason')
+                  out['text'] = (j['choices'][0].get('message') or {}).get('content', '')[:40]
+              if 'content' in j and isinstance(j['content'], list):
+                  out['text'] = ' '.join(c.get('text', '') for c in j['content'] if c.get('type') == 'text')[:40]
+              if 'error' in j:
+                  out['error'] = j['error']
+              print('fields:', json.dumps(out, ensure_ascii=False)[:800])
+
+          tok = os.environ.get('OPENCODE_API_KEY', '')
+          msg = [{'role': 'user', 'content': 'Reply with just: ok'}]
+          ant = 'https://opencode.ai/inference/go/anthropic/v1/messages'
+          oai = 'https://opencode.ai/inference/go/openai/v1/chat/completions'
+          ant_body = {'model': 'deepseek-v4.1-flash', 'max_tokens': 16, 'messages': msg}
+          oai_body = {'model': 'deepseek-v4.1-flash', 'max_tokens': 16, 'messages': msg}
+          v = {'anthropic-version': '2023-06-01'}
+
+          report('token -> Go anthropic (Authorization: Bearer, as OCR llm_auth_token)', *call(ant, ant_body, {**v, 'Authorization': f'Bearer {tok}'}))
+          report('token -> Go anthropic (x-api-key)', *call(ant, ant_body, {**v, 'x-api-key': tok}))
+          report('token -> Go openai (Bearer, as opencode-go provider)', *call(oai, oai_body, {'Authorization': f'Bearer {tok}'}))
+          report('no credential -> Go anthropic (expected 401)', *call(ant, ant_body, v))
+          if os.environ.get('GO_KEY'):
+              report('secret OPENCODE_GO_API_KEY -> Go anthropic (comparison)', *call(ant, ant_body, {**v, 'Authorization': f"Bearer {os.environ['GO_KEY']}"}))
