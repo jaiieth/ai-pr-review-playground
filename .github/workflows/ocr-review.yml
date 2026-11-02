@@ -1,8 +1,11 @@
 name: OCR Review
 
 # The only automatic reviewer: Alibaba open-code-review (OCR) v1.13.3 via the OpenCode Go subscription.
-# Required secret: OPENCODE_GO_API_KEY (oc_sk_... from the Go-subscribed workspace).
+# Credential (one of): repo var OPENCODE_CLIENT_ID = OpenCode service-account credential (GitHub OIDC,
+#   1-hour token, no stored key; the console credential decides which events it trusts), and/or secret
+#   OPENCODE_GO_API_KEY (oc_sk_... from the Go-subscribed workspace; fallback). See 'Sign in to OpenCode'.
 # Optional repo variables (Settings > Secrets and variables > Actions > Variables):
+#   OPENCODE_AUTH_MODE     default auto                  (auto | token | secret; shared with opencode.yml)
 #   OCR_MODEL              default deepseek-v4.1-flash   (supported: deepseek-*, glm-5.3-flash)
 #   OCR_PROTOCOL           default anthropic             (anthropic | openai)
 #   OCR_THINKING           default on                    (on | off; anthropic on = budget_tokens 8000)
@@ -116,15 +119,60 @@ jobs:
     permissions:
       contents: read        # checkout + git fetch of base / PR head
       pull-requests: write  # inline review comments + sticky summary comment
+      id-token: write       # GitHub OIDC token for the OpenCode service-account sign-in
     steps:
-      - name: Check secret
+      - name: Sign in to OpenCode
+        # OPENCODE_AUTH_MODE (repo var): auto (default) | token | secret
+        #   auto:   service-account token via GitHub OIDC when vars.OPENCODE_CLIENT_ID is set and the
+        #           exchange succeeds, otherwise secrets.OPENCODE_GO_API_KEY
+        #   token:  token only (the secret is never read); secret: key only (no exchange)
+        # The credential is exported as env OPENCODE_API_KEY for the later steps of this job.
+        id: auth
         env:
-          KEY: ${{ secrets.OPENCODE_GO_API_KEY }}
+          CLIENT_ID: ${{ vars.OPENCODE_CLIENT_ID }}
+          AUTH_MODE: ${{ vars.OPENCODE_AUTH_MODE || 'auto' }}
+          FALLBACK_KEY: ${{ vars.OPENCODE_AUTH_MODE != 'token' && secrets.OPENCODE_GO_API_KEY || '' }}
         run: |
-          if [ -z "$KEY" ]; then
-            echo "::error::OPENCODE_GO_API_KEY is not available to this run. Fork PRs never get secrets; Dependabot PRs read Dependabot secrets, so add the key there too if Dependabot PRs should be reviewed."
+          set -uo pipefail
+          # Never prints the OIDC token, the OpenCode token or the key (all masked before use).
+          case "$AUTH_MODE" in auto|token|secret) ;; *) echo "::error::OPENCODE_AUTH_MODE must be auto, token or secret (got '$AUTH_MODE')"; exit 1 ;; esac
+          token='' mode=none
+          if [ "$AUTH_MODE" != secret ] && [ -n "$CLIENT_ID" ]; then
+            if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+              echo "::notice::No GitHub OIDC token in this run (fork PR, or the job lacks id-token: write)"
+            else
+              # Same calls as the OpenCode console snippet (credential trust: see OCR-SETUP.md).
+              oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://opencode.ai/console" | jq -r '.value // empty') || oidc=''
+              [ -n "$oidc" ] && echo "::add-mask::$oidc"
+              resp=$(mktemp)
+              status=$(curl -sS -o "$resp" -w '%{http_code}' -X POST https://opencode.ai/console/auth/oauth/token \
+                -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+                -d "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+                -d "client_id=$CLIENT_ID" \
+                -d "subject_token=$oidc") || status=000
+              token=$(jq -r '.access_token // empty' "$resp" 2>/dev/null) || token=''
+              if [ -n "$token" ]; then
+                echo "::add-mask::$token"
+                mode=token
+                echo "OpenCode sign-in: service-account token (HTTP $status, expires in $(jq -r '.expires_in // "?"' "$resp")s)"
+              else
+                echo "::warning::OpenCode token exchange failed for event ${GITHUB_EVENT_NAME} (HTTP $status): $(jq -c '{error, error_description}' "$resp" 2>/dev/null || echo 'non-JSON response'). The console credential may not trust this event."
+              fi
+              rm -f "$resp"
+            fi
+          fi
+          if [ -z "$token" ] && [ -n "$FALLBACK_KEY" ]; then
+            token=$FALLBACK_KEY
+            mode=secret
+            echo "OpenCode sign-in: secrets.OPENCODE_GO_API_KEY"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          if [ -z "$token" ]; then
+            echo "::error::No OpenCode credential for this run (auth mode $AUTH_MODE). Token: needs vars.OPENCODE_CLIENT_ID, id-token: write and an event the console credential trusts (fork PRs get no OIDC token). Key: secrets.OPENCODE_GO_API_KEY (fork PRs never get secrets; Dependabot PRs read Dependabot secrets)."
             exit 1
           fi
+          echo "OPENCODE_API_KEY=$token" >> "$GITHUB_ENV"
 
       - name: Resolve PR (workflow_dispatch)
         id: pr
@@ -231,7 +279,7 @@ jobs:
         with:
           ocr_version: '1.13.3'
           llm_url: ${{ steps.llm.outputs.url }}
-          llm_auth_token: ${{ secrets.OPENCODE_GO_API_KEY }}
+          llm_auth_token: ${{ env.OPENCODE_API_KEY }}   # set by 'Sign in to OpenCode'
           llm_model: ${{ steps.llm.outputs.model }}
           llm_protocol: ${{ steps.llm.outputs.protocol }}
           llm_use_anthropic: ${{ steps.llm.outputs.use_anthropic }}
