@@ -4,6 +4,7 @@ name: OpenCode OIDC diagnostic
 # then make tiny requests to the OpenCode Go endpoints. Never prints any token or key:
 # only HTTP status codes and non-secret response fields.
 on:
+  pull_request:
   workflow_dispatch:
     inputs:
       compare_secret:
@@ -22,76 +23,36 @@ jobs:
       contents: read
     steps:
       - name: Sign in to OpenCode (OIDC token exchange)
+        # Same curl calls as the OpenCode console snippet, plus status/claim printing. Never prints a token.
         env:
-          AUDIENCE: https://opencode.ai/console
           CLIENT_ID: ${{ vars.OPENCODE_CLIENT_ID }}
-        shell: python3 {0}
         run: |
-          import base64, json, os, sys, urllib.error, urllib.parse, urllib.request
-
-          def call(url, data=None, headers=None):
-              # real curl (Cloudflare in front of opencode.ai rejects the Python-urllib signature: error 1010).
-              # Headers and body go through files/stdin so no credential appears on a command line.
-              import subprocess, tempfile
-              with tempfile.TemporaryDirectory() as d:
-                  hf, bf, rf = f'{d}/h', f'{d}/b', f'{d}/resp'
-                  with open(hf, 'w') as f:
-                      f.write(''.join(f'{k}: {v}\n' for k, v in (headers or {}).items()))
-                  cmd = ['curl', '-sS', '-o', bf, '-D', rf, '-w', '%{http_code}', '-H', f'@{hf}', url]
-                  if data is not None:
-                      cmd += ['--data-binary', '@-']
-                  p = subprocess.run(cmd, input=data, capture_output=True)
-                  if p.returncode:
-                      print('curl error:', p.stderr.decode(errors='replace')[:300])
-                  body = open(bf, 'rb').read() if os.path.exists(bf) else b''
-                  hdr = {}
-                  if os.path.exists(rf):
-                      for line in open(rf, errors='replace').read().replace('\r', '').strip().split('\n\n')[-1].splitlines()[1:]:
-                          if ':' in line:
-                              k, v = line.split(':', 1)
-                              hdr[k.strip()] = v.strip()
-                  return int(p.stdout or 0), body, hdr
-
-          if not os.environ.get('CLIENT_ID'):
-              sys.exit('::error::vars.OPENCODE_CLIENT_ID is not set')
-          url = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=' + urllib.parse.quote(os.environ['AUDIENCE'], safe='')
-          st, body, _ = call(url, headers={'Authorization': 'bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
-          print(f'GitHub OIDC request: HTTP {st}')
-          if st != 200:
-              sys.exit(1)
-          oidc = json.loads(body)['value']
-          print('::add-mask::' + oidc)
-          claims = json.loads(base64.urlsafe_b64decode(oidc.split('.')[1] + '=='))
-          print('OIDC claims (non-secret):', json.dumps({k: claims.get(k) for k in ('iss', 'aud', 'sub', 'repository', 'ref', 'event_name', 'job_workflow_ref')}))
-
-          data = urllib.parse.urlencode({
-              'grant_type': 'urn:ietf:params:oauth:grant-type:token-exchange',
-              'subject_token_type': 'urn:ietf:params:oauth:token-type:jwt',
-              'client_id': os.environ['CLIENT_ID'],
-              'subject_token': oidc,
-          }).encode()
-          st, body, hdr = call('https://opencode.ai/console/auth/oauth/token', data=data,
-                               headers={'Content-Type': 'application/x-www-form-urlencoded'})
-          print(f'OpenCode token exchange: HTTP {st}, content-type {hdr.get("Content-Type")}')
-          try:
-              j = json.loads(body)
-          except Exception:
-              print('non-JSON body (first 300 chars):', body[:300].decode(errors='replace'))
-              sys.exit(1)
-          tok = j.get('access_token') if isinstance(j, dict) else None
-          if tok:
-              print('::add-mask::' + tok)
-          safe = {k: v for k, v in j.items() if k not in ('access_token', 'refresh_token', 'id_token')} if isinstance(j, dict) else j
-          print('exchange response fields (secrets removed):', json.dumps(safe)[:600])
-          if not tok:
-              sys.exit('::error::no access_token in exchange response')
-          print(f'access_token: present, length {len(tok)}, looks like JWT: {tok.count(".") == 2}')
-          with open(os.environ['GITHUB_ENV'], 'a') as f:
-              f.write(f'OPENCODE_API_KEY={tok}\n')
+          set -euo pipefail
+          [ -n "$CLIENT_ID" ] || { echo "::error::vars.OPENCODE_CLIENT_ID is not set"; exit 1; }
+          oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://opencode.ai/console" | jq -r .value)
+          echo "::add-mask::$oidc"
+          echo "GitHub OIDC token: length ${#oidc}"
+          # payload claims are not secret (the signature is what matters, and the full token stays masked)
+          python3 -c 'import base64,json,sys; c=json.loads(base64.urlsafe_b64decode(sys.argv[1].split(".")[1]+"=="));
+          print("OIDC claims:", json.dumps({k: c.get(k) for k in ("iss","aud","sub","repository","ref","event_name","job_workflow_ref","head_ref","base_ref")}))' "$oidc"
+          status=$(curl -sS -o /tmp/exch.json -w '%{http_code}' -X POST https://opencode.ai/console/auth/oauth/token \
+            -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+            -d "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+            -d "client_id=$CLIENT_ID" \
+            -d "subject_token=$oidc")
+          token=$(jq -r '.access_token // empty' /tmp/exch.json 2>/dev/null || true)
+          [ -n "$token" ] && echo "::add-mask::$token"
+          echo "OpenCode token exchange: HTTP $status"
+          echo "exchange response (secrets removed): $(jq -c 'del(.access_token, .refresh_token, .id_token)' /tmp/exch.json 2>/dev/null || head -c 300 /tmp/exch.json)"
+          rm -f /tmp/exch.json
+          [ -n "$token" ] || { echo "::error::no access_token in exchange response"; exit 1; }
+          case "$token" in oc_sk_*) kind=oc_sk_key;; eyJ*) kind=JWT;; *) kind=other;; esac; echo "access_token: present, length ${#token}, kind $kind"
+          echo "OPENCODE_API_KEY=$token" >> "$GITHUB_ENV"
 
       - name: Ping OpenCode Go endpoints
         env:
-          GO_KEY: ${{ inputs.compare_secret && secrets.OPENCODE_GO_API_KEY || '' }}
+          GO_KEY: ${{ (github.event_name == 'pull_request' || inputs.compare_secret) && secrets.OPENCODE_GO_API_KEY || '' }}
         shell: python3 {0}
         run: |
           import json, os, urllib.error, urllib.request
