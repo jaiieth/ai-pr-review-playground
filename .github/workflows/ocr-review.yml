@@ -1,11 +1,10 @@
 name: OCR Review
 
 # The only automatic reviewer: Alibaba open-code-review (OCR) v1.13.3 via the OpenCode Go subscription.
-# Credential (one of): repo var OPENCODE_CLIENT_ID = OpenCode service-account credential (GitHub OIDC,
-#   1-hour token, no stored key; the console credential decides which events it trusts), and/or secret
-#   OPENCODE_GO_API_KEY (oc_sk_... from the Go-subscribed workspace; fallback). See 'Sign in to OpenCode'.
+# Credential: repo var OPENCODE_CLIENT_ID = OpenCode service-account credential (GitHub OIDC, 1-hour token,
+#   no stored key; pull_request events only). Without it: secret OPENCODE_GO_API_KEY (oc_sk_... from the
+#   Go-subscribed workspace). See 'Sign in to OpenCode'. Only pull_request events (no workflow_dispatch).
 # Optional repo variables (Settings > Secrets and variables > Actions > Variables):
-#   OPENCODE_AUTH_MODE     default auto                  (auto | token | secret; shared with opencode.yml)
 #   OCR_MODEL              default deepseek-v4.1-flash   (supported: deepseek-*, glm-5.3-flash)
 #   OCR_PROTOCOL           default anthropic             (anthropic | openai)
 #   OCR_THINKING           default on                    (on | off; anthropic on = budget_tokens 8000)
@@ -23,88 +22,26 @@ name: OCR Review
 on:
   pull_request:
     types: [opened, reopened, ready_for_review, synchronize, labeled]
-  workflow_dispatch:
-    inputs:
-      pr_number:
-        description: PR number to review (drafts included)
-        required: true
-        type: string
-      full_review:
-        description: Review the whole PR from the merge-base (ignore the last checkpoint)
-        required: false
-        type: boolean
-        default: false
-      model:
-        description: Model override (empty = repo var OCR_MODEL)
-        required: false
-        type: string
-        default: ''
-      protocol:
-        description: Protocol override
-        required: false
-        type: choice
-        options: [repo-var, anthropic, openai]
-        default: repo-var
-      thinking:
-        description: Thinking override
-        required: false
-        type: choice
-        options: [repo-var, 'on', 'off']
-        default: repo-var
 
 permissions: {}
 
 jobs:
-  # OCR itself always reviews the WHOLE PR on ready_for_review / reopened (event_full_scope in
-  # open-code-review's post-review-comments.js). When the PR was already reviewed through the label,
-  # hand the ready event over to workflow_dispatch instead, so the checkpoint applies and only
-  # commits pushed since that review are reviewed (no-op when there are none).
-  # workflow_dispatch created with GITHUB_TOKEN is allowed to start a run.
-  ready-handoff:
-    if: >
-      github.event_name == 'pull_request' && github.event.action == 'ready_for_review' &&
-      contains(github.event.pull_request.labels.*.name, vars.OCR_TRIGGER_LABEL || 'ai-review')
-    runs-on: ubuntu-slim
-    timeout-minutes: 3
-    permissions:
-      actions: write   # create the workflow_dispatch event
-    steps:
-      - name: Dispatch checkpoint review
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          REF: ${{ github.event.repository.default_branch }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        shell: python3 {0}
-        run: |
-          import json, os, urllib.request
-          url = f"https://api.github.com/repos/{os.environ['REPO']}/actions/workflows/ocr-review.yml/dispatches"
-          data = json.dumps({'ref': os.environ['REF'], 'inputs': {'pr_number': os.environ['PR_NUMBER']}}).encode()
-          req = urllib.request.Request(url, data=data, method='POST', headers={
-              'Authorization': f"Bearer {os.environ['GITHUB_TOKEN']}",
-              'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'})
-          with urllib.request.urlopen(req, timeout=30) as r:
-              print(f"dispatched checkpoint review for PR #{os.environ['PR_NUMBER']} (HTTP {r.status})")
-
   ocr-review:
     # Bot/agent PRs ARE reviewed (no actor/sender filter). Skipped jobs never start (0 minutes).
     # Triggers:
-    #   workflow_dispatch(pr_number)            -> always (drafts too; checkpoint unless full_review)
     #   labeled with OCR_TRIGGER_LABEL          -> always (drafts too, skip list ignored: explicit request);
     #                                              remove + re-add the label to run again
-    #   ready_for_review                        -> PR never label-reviewed: full review here;
-    #                                              PR carries the label: ready-handoff above (checkpoint)
+    #   ready_for_review                        -> full review (OCR always reviews the whole PR on
+    #                                              ready/reopened, also after a label review; inline
+    #                                              comments on lines that already have one are skipped)
     #   opened / reopened / synchronize         -> non-draft PRs (drafts only if OCR_REVIEW_DRAFTS == 'true'),
     #                                              head branch not in the skip list
     #   head branch in AI_SKIP_HEAD_BRANCHES / starting with AI_SKIP_HEAD_PREFIX = release / sync PRs
     #   (skipped). Task PRs branch-x -> main ARE reviewed.
     if: >
-      github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
        github.event.label.name == (vars.OCR_TRIGGER_LABEL || 'ai-review')) ||
       (github.event_name == 'pull_request' && github.event.action != 'labeled' &&
-       (github.event.action != 'ready_for_review' ||
-        !contains(github.event.pull_request.labels.*.name, vars.OCR_TRIGGER_LABEL || 'ai-review')) &&
        !contains(format(',{0},', vars.AI_SKIP_HEAD_BRANCHES || 'main,develop'), format(',{0},', github.head_ref)) &&
        !(vars.AI_SKIP_HEAD_PREFIX != '-' && startsWith(github.head_ref, vars.AI_SKIP_HEAD_PREFIX || 'release/')) &&
        (!github.event.pull_request.draft || vars.OCR_REVIEW_DRAFTS == 'true'))
@@ -114,7 +51,7 @@ jobs:
     # from the last recorded checkpoint, so cancelled work is picked up). Job-level so skipped
     # runs (other labels, drafts) never enter or cancel the group.
     concurrency:
-      group: ocr-review-${{ github.event.pull_request.number || inputs.pr_number }}
+      group: ocr-review-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     permissions:
       contents: read        # checkout + git fetch of base / PR head
@@ -122,100 +59,60 @@ jobs:
       id-token: write       # GitHub OIDC token for the OpenCode service-account sign-in
     steps:
       - name: Sign in to OpenCode
-        # OPENCODE_AUTH_MODE (repo var): auto (default) | token | secret
-        #   auto:   service-account token via GitHub OIDC when vars.OPENCODE_CLIENT_ID is set and the
-        #           exchange succeeds, otherwise secrets.OPENCODE_GO_API_KEY
-        #   token:  token only (the secret is never read); secret: key only (no exchange)
-        # The credential is exported as env OPENCODE_API_KEY for the later steps of this job.
+        # vars.OPENCODE_CLIENT_ID set -> OpenCode service-account token via GitHub OIDC (1 hour; the
+        # console credential trusts pull_request workflows of this repo; fork PRs get no OIDC token).
+        # Not set -> secrets.OPENCODE_GO_API_KEY. Exported as env OPENCODE_API_KEY for later steps.
         id: auth
         env:
           CLIENT_ID: ${{ vars.OPENCODE_CLIENT_ID }}
-          AUTH_MODE: ${{ vars.OPENCODE_AUTH_MODE || 'auto' }}
-          FALLBACK_KEY: ${{ vars.OPENCODE_AUTH_MODE != 'token' && secrets.OPENCODE_GO_API_KEY || '' }}
+          KEY: ${{ vars.OPENCODE_CLIENT_ID == '' && secrets.OPENCODE_GO_API_KEY || '' }}
         run: |
           set -uo pipefail
-          # Never prints the OIDC token, the OpenCode token or the key (all masked before use).
-          case "$AUTH_MODE" in auto|token|secret) ;; *) echo "::error::OPENCODE_AUTH_MODE must be auto, token or secret (got '$AUTH_MODE')"; exit 1 ;; esac
-          token='' mode=none
-          if [ "$AUTH_MODE" != secret ] && [ -n "$CLIENT_ID" ]; then
+          # Never prints the OIDC token, the OpenCode token or the key (masked before use).
+          if [ -n "$CLIENT_ID" ]; then
             if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-              echo "::notice::No GitHub OIDC token in this run (fork PR, or the job lacks id-token: write)"
-            else
-              # Same calls as the OpenCode console snippet (credential trust: see OCR-SETUP.md).
-              oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-                "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://opencode.ai/console" | jq -r '.value // empty') || oidc=''
-              [ -n "$oidc" ] && echo "::add-mask::$oidc"
-              resp=$(mktemp)
-              status=$(curl -sS -o "$resp" -w '%{http_code}' -X POST https://opencode.ai/console/auth/oauth/token \
-                -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
-                -d "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
-                -d "client_id=$CLIENT_ID" \
-                -d "subject_token=$oidc") || status=000
-              token=$(jq -r '.access_token // empty' "$resp" 2>/dev/null) || token=''
-              if [ -n "$token" ]; then
-                echo "::add-mask::$token"
-                mode=token
-                echo "OpenCode sign-in: service-account token (HTTP $status, expires in $(jq -r '.expires_in // "?"' "$resp")s)"
-              else
-                echo "::warning::OpenCode token exchange failed for event ${GITHUB_EVENT_NAME} (HTTP $status): $(jq -c '{error, error_description}' "$resp" 2>/dev/null || echo 'non-JSON response'). The console credential may not trust this event."
-              fi
-              rm -f "$resp"
+              echo "::error::No GitHub OIDC token in this run (fork PR, or the job lacks id-token: write)"
+              exit 1
             fi
-          fi
-          if [ -z "$token" ] && [ -n "$FALLBACK_KEY" ]; then
-            token=$FALLBACK_KEY
-            mode=secret
+            # Same calls as the OpenCode console snippet.
+            oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://opencode.ai/console" | jq -r '.value // empty') || oidc=''
+            [ -n "$oidc" ] && echo "::add-mask::$oidc"
+            resp=$(mktemp)
+            status=$(curl -sS -o "$resp" -w '%{http_code}' -X POST https://opencode.ai/console/auth/oauth/token \
+              -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+              -d "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+              -d "client_id=$CLIENT_ID" \
+              -d "subject_token=$oidc") || status=000
+            token=$(jq -r '.access_token // empty' "$resp" 2>/dev/null) || token=''
+            if [ -z "$token" ]; then
+              echo "::error::OpenCode token exchange failed (HTTP $status): $(jq -c '{error, error_description}' "$resp" 2>/dev/null || echo 'non-JSON response'). Check the OPENCODE_CLIENT_ID credential in the OpenCode console (it must trust pull_request workflows of ${GITHUB_REPOSITORY})."
+              rm -f "$resp"
+              exit 1
+            fi
+            echo "::add-mask::$token"
+            echo "OpenCode sign-in: service-account token (HTTP $status, expires in $(jq -r '.expires_in // "?"' "$resp")s)"
+            rm -f "$resp"
+          elif [ -n "$KEY" ]; then
+            token=$KEY
             echo "OpenCode sign-in: secrets.OPENCODE_GO_API_KEY"
-          fi
-          echo "mode=$mode" >> "$GITHUB_OUTPUT"
-          if [ -z "$token" ]; then
-            echo "::error::No OpenCode credential for this run (auth mode $AUTH_MODE). Token: needs vars.OPENCODE_CLIENT_ID, id-token: write and an event the console credential trusts (fork PRs get no OIDC token). Key: secrets.OPENCODE_GO_API_KEY (fork PRs never get secrets; Dependabot PRs read Dependabot secrets)."
+          else
+            echo "::error::No OpenCode credential: set repo var OPENCODE_CLIENT_ID (service account) or secret OPENCODE_GO_API_KEY. Fork PRs never get secrets; Dependabot PRs read Dependabot secrets."
             exit 1
           fi
           echo "OPENCODE_API_KEY=$token" >> "$GITHUB_ENV"
 
-      - name: Resolve PR (workflow_dispatch)
-        id: pr
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-        run: |
-          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::pr_number must be a positive integer (got '$PR_NUMBER')"
-            exit 1
-          fi
-          read -r STATE BASE_REF HEAD_SHA < <(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
-            --jq '[.state, .base.ref, .head.sha] | @tsv')
-          if [ "$STATE" != "open" ]; then
-            echo "::error::PR #${PR_NUMBER} is ${STATE}, not open"
-            exit 1
-          fi
-          {
-            echo "pr_number=${PR_NUMBER}"
-            echo "base_ref=${BASE_REF}"
-            echo "head_sha=${HEAD_SHA}"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Map model / protocol / thinking to OCR inputs
         id: llm
         env:
-          IN_MODEL: ${{ inputs.model }}
-          IN_PROTOCOL: ${{ inputs.protocol }}
-          IN_THINKING: ${{ inputs.thinking }}
           VAR_MODEL: ${{ vars.OCR_MODEL }}
           VAR_PROTOCOL: ${{ vars.OCR_PROTOCOL }}
           VAR_THINKING: ${{ vars.OCR_THINKING }}
         run: |
-          pick() { # dispatch override > repo var > default
-            local in="$1" var="$2" def="$3"
-            if [ -n "$in" ] && [ "$in" != "repo-var" ]; then echo "$in"
-            elif [ -n "$var" ]; then echo "$var"
-            else echo "$def"; fi
-          }
-          MODEL="$(pick "$IN_MODEL" "$VAR_MODEL" deepseek-v4.1-flash | tr '[:upper:]' '[:lower:]')"
-          PROTOCOL="$(pick "$IN_PROTOCOL" "$VAR_PROTOCOL" anthropic | tr '[:upper:]' '[:lower:]')"
-          THINKING="$(pick "$IN_THINKING" "$VAR_THINKING" on | tr '[:upper:]' '[:lower:]')"
+          # repo var > default
+          MODEL="$(echo "${VAR_MODEL:-deepseek-v4.1-flash}" | tr '[:upper:]' '[:lower:]')"
+          PROTOCOL="$(echo "${VAR_PROTOCOL:-anthropic}" | tr '[:upper:]' '[:lower:]')"
+          THINKING="$(echo "${VAR_THINKING:-on}" | tr '[:upper:]' '[:lower:]')"
 
           if [[ ! "$MODEL" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
             echo "::error::Invalid model id '$MODEL'"; exit 1
@@ -289,10 +186,6 @@ jobs:
           # reserved header in OCR and would be rejected here. Session ID for Go routing/caching:
           llm_extra_headers: 'x-opencode-session={ocr_session_key}'
           language: Thai
-          # Empty on pull_request (the action reads the event); set on workflow_dispatch.
-          pr_number: ${{ steps.pr.outputs.pr_number }}
-          base_ref: ${{ steps.pr.outputs.base_ref }}
-          head_sha: ${{ steps.pr.outputs.head_sha }}
           upload_artifacts: 'true'
           # Sticky summary comment (updated in place) + cross-push checkpoint: each push reviews
           # only <last reviewed head>..<new head>; falls back to a full review when unsure
@@ -301,4 +194,4 @@ jobs:
           sticky_summary: 'true'
           checkpoint_range: 'true'
           incremental: 'true'
-          full_review: ${{ inputs.full_review && 'true' || 'false' }}
+          full_review: 'false'

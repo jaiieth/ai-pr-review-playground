@@ -2,29 +2,34 @@
 
 | Workflow | หน้าที่ | ทำงานเมื่อ |
 |---|---|---|
-| `.github/workflows/ocr-review.yml` | **ตัวรีวิวตัวเดียว** ใช้ OCR (alibaba/open-code-review v1.13.3) + `deepseek-v4.1-flash` เปิด thinking ภาษาไทย มี inline comment และ sticky summary | PR ที่ไม่ใช่ draft: opened / reopened / push (synchronize); ทุก PR (รวม draft): ติด label `ai-review` หรือ workflow_dispatch; ready_for_review ทุกครั้ง |
+| `.github/workflows/ocr-review.yml` | **ตัวรีวิวตัวเดียว** ใช้ OCR (alibaba/open-code-review v1.13.3) + `deepseek-v4.1-flash` เปิด thinking ภาษาไทย มี inline comment และ sticky summary | PR ที่ไม่ใช่ draft: opened / reopened / push (synchronize); ทุก PR (รวม draft): ติด label `ai-review`; ready_for_review ทุกครั้ง (รีวิวทั้ง PR) |
 | `.github/workflows/opencode.yml` | **สรุปอย่างเดียว** (ไม่รีวิว ไม่มี inline) OpenCode เขียนสรุปภาษาไทยว่า PR เกี่ยวกับอะไร เปลี่ยนอะไรหลัก ๆ และจุดที่ reviewer ควรดู แล้วโพสต์เป็น comment สรุปทั้ง PR 1 อัน และ push ต่อมาได้ comment "อัปเดต PR" แยกต่อ push **ไม่แก้ PR body** | เฉพาะ PR ที่ **ไม่มี description** (ดูหัวข้อ "เงื่อนไขของ OpenCode summary") |
 
-PR-Agent ถูกถอดออกแล้ว (`pr-agent.yml`, `.pr_agent.toml`) ส่วนคำสั่ง `/oc` ใน comment ก็ถอดออกด้วย เพราะต้องใช้ trigger `issue_comment` + สิทธิ์เพิ่ม และไม่อยู่ในขอบเขต "สรุปอย่างเดียว" ถ้าอยากให้ OCR รีวิวใหม่ให้ใช้ label `ai-review` หรือ workflow_dispatch แทน
+PR-Agent ถูกถอดออกแล้ว (`pr-agent.yml`, `.pr_agent.toml`) ส่วนคำสั่ง `/oc` ใน comment ก็ถอดออกด้วย เพราะต้องใช้ trigger `issue_comment` + สิทธิ์เพิ่ม และไม่อยู่ในขอบเขต "สรุปอย่างเดียว" ถ้าอยากให้ OCR รีวิวใหม่ให้เอา label `ai-review` ออกแล้วติดใหม่
+
+ทั้ง 2 workflow รับเฉพาะ event `pull_request` (**ไม่มี workflow_dispatch / ปุ่ม Run workflow**) เพราะ credential แบบ service account ของ OpenCode เชื่อถือเฉพาะ workflow ที่รันจาก pull request
 
 ไฟล์อื่น: `.opencodereview/rule.json` คือกฎรีวิวภาษาไทยและรายการไฟล์ที่ไม่ต้องรีวิว (OCR อ่านเอง)
 
 ## สิ่งที่ Earth ต้องทำเอง (ครั้งเดียว)
 1. **OpenCode Console** (workspace ที่มี Go subscription)
-   - สร้าง API key `oc_sk_...`
+   - **แนะนำ: service account** (ไม่ต้องเก็บ key ใน GitHub) สร้าง credential แบบ GitHub Actions ขอบเขต "Workflows in <owner>/<repo> for pull requests" แล้วจด client id (`sk_...` ไม่ใช่ความลับ) ทุกรัน workflow จะขอ OIDC token จาก GitHub (audience `https://opencode.ai/console`) แล้วแลกเป็น token อายุ 1 ชั่วโมงที่ `https://opencode.ai/console/auth/oauth/token` ใช้โควตา Go เดิม (playground: `billing_source: "go"`, `cost: 0`)
+   - หรือแบบเดิม: สร้าง API key `oc_sk_...`
    - Settings › Privacy › Regions เลือก **Global** (ไม่เลือก DeepSeek V4.1 Flash จะใช้ไม่ได้)
    - **ปิด** toggle "Allow paid endpoints that train on request data" (ดูหัวข้อ muse ด้านล่าง)
 2. **GitHub repo erp-api** › Settings › Secrets and variables › Actions
-   - Secret `OPENCODE_GO_API_KEY` = key จากข้อ 1 (ถ้าจะให้รีวิว PR ของ Dependabot ต้องใส่ชื่อเดียวกันใน **Dependabot secrets** ด้วย PR จาก fork จะไม่ได้ secret)
+   - Variable `OPENCODE_CLIENT_ID` = client id ของ service account (ตั้งแล้ว = ใช้ token เสมอ ไม่อ่าน secret) **หรือ** Secret `OPENCODE_GO_API_KEY` = key `oc_sk_...` (ใช้เมื่อไม่ได้ตั้ง `OPENCODE_CLIENT_ID`; ถ้าจะให้รีวิว PR ของ Dependabot ต้องใส่ชื่อเดียวกันใน **Dependabot secrets** ด้วย)
+   - PR จาก fork ไม่ได้ทั้ง OIDC token และ secret → OCR fail ที่ "Sign in to OpenCode", summary ข้าม
    - Variables: ไม่ต้องใส่ก็ได้ ทุกตัวมี default (ตารางด้านล่าง) ถ้าเคยตั้ง `PR_AGENT_MODEL` ไว้ให้ลบทิ้ง
 3. สร้าง label `ai-review` (Issues › Labels › New label) ถ้าจะใช้สั่งรีวิว draft
 4. Settings › Actions › General: อนุญาตให้รัน Actions ได้ (และ Workflow permissions แบบ read ก็พอ เพราะแต่ละ job ขอ `pull-requests: write` เอง)
-5. Merge 2 workflow + `rule.json` เข้า default branch (workflow_dispatch จะใช้ได้ก็ต่อเมื่อไฟล์อยู่บน default branch แล้ว) และลบไฟล์ PR-Agent เดิมถ้ามี
+5. Merge 2 workflow + `rule.json` เข้า default branch และลบไฟล์ PR-Agent เดิมถ้ามี
 6. วันที่ 1 พ.ย. 2026: เช็กหน้า Privacy ของ OpenCode Go ว่าข้อตกลง ZDR ของ DeepSeek (มีผลถึง 31 ต.ค. 2026) ต่ออายุแล้วหรือยัง
 
 ## Repo variables
 | Variable | Default | ใช้กับ | ความหมาย |
 |---|---|---|---|
+| `OPENCODE_CLIENT_ID` | – | ทั้งคู่ | client id ของ service account (ไม่ใช่ความลับ) ตั้ง = ใช้ OIDC token, ไม่ตั้ง = ใช้ secret `OPENCODE_GO_API_KEY` |
 | `OCR_MODEL` | `deepseek-v4.1-flash` | OCR | `deepseek-*` หรือ `glm-5.3-flash` |
 | `OCR_PROTOCOL` | `anthropic` | OCR | `anthropic` หรือ `openai` |
 | `OCR_THINKING` | `on` | OCR | `on` / `off` (anthropic + on = `budget_tokens: 8000`) |
@@ -40,14 +45,12 @@ PR-Agent ถูกถอดออกแล้ว (`pr-agent.yml`, `.pr_agent.tom
 
 ## พฤติกรรมของ OCR review
 - PR ที่ไม่ใช่ draft (เช่นเปิดตรง ๆ ไม่ผ่าน ClickUp): รันเมื่อ opened / reopened / synchronize เหมือนเดิม
-- ready_for_review: รันทุกครั้ง แต่ OCR ในตัว action จะรีวิว **ทั้ง PR** เสมอเมื่อ event เป็น `ready_for_review`/`reopened` (`event_full_scope` ใน [post-review-comments.js](https://github.com/alibaba/open-code-review/blob/375f64cd6f67a48a135da83cfcf59c52669a09cb/scripts/github-actions/post-review-comments.js) ไม่มี input ให้ปิด) จึงแยกเป็น 2 กรณี
-  - PR **ยังไม่เคยติด label** (ไม่เคยถูกรีวิว) → รีวิวทั้ง PR ตรง ๆ
-  - PR **ติด label `ai-review` อยู่** (รีวิวไปแล้ว) → job `ready-handoff` (ubuntu-slim ~5 วินาที) ยิง workflow_dispatch ให้ PR นั้น ซึ่งใช้ checkpoint ได้ จึงรีวิวเฉพาะ commit ที่ push หลังรอบ label (ไม่มี commit ใหม่ = no-op) ต้องให้ job มีสิทธิ์ `actions: write` (ขอเองใน job นั้น)
-- **ติด label `ai-review`** หรือ **workflow_dispatch(pr_number)** = รีวิวทันที ทำงานกับ draft ด้วย เป็นทางที่ bot ของ ClickUp จะใช้ตอนย้าย task ไป Review; label ค้างไว้ไม่ทำให้รีวิวทุก push ถ้าต้องการรันใหม่ให้ลบ label แล้วติดใหม่
+- ready_for_review: รันทุกครั้ง แต่ OCR ในตัว action จะรีวิว **ทั้ง PR** เสมอเมื่อ event เป็น `ready_for_review`/`reopened` (`event_full_scope` ใน [post-review-comments.js](https://github.com/alibaba/open-code-review/blob/375f64cd6f67a48a135da83cfcf59c52669a09cb/scripts/github-actions/post-review-comments.js) ไม่มี input ให้ปิด) ดังนั้น **ready หลังรีวิวด้วย label แล้ว = รีวิวทั้ง PR อีกรอบ** (ยอมรับ: inline ที่ซ้ำบรรทัดเดิมไม่โพสต์ซ้ำเพราะ `incremental: true`, เสีย ~3 นาที runner)
+- **ติด label `ai-review`** = รีวิวทันที ทำงานกับ draft ด้วย เป็นทางที่ bot ของ ClickUp จะใช้ตอนย้าย task ไป Review; label ค้างไว้ไม่ทำให้รีวิวทุก push ถ้าต้องการรันใหม่ให้ลบ label แล้วติดใหม่
 - **push ใหม่ = รีวิวเฉพาะ commit ใหม่** (`checkpoint_range: true` + `sticky_summary: true`) OCR จด checkpoint ไว้ใน sticky summary comment แล้วรอบถัดไปรีวิวแค่ `<checkpoint>..<head ใหม่>` ถ้าหา checkpoint ไม่ได้ (เช่น force-push ทับ) จะกลับไปรีวิวทั้ง PR เอง (fail closed)
 - `incremental: true` = ไม่โพสต์ inline ซ้ำบนบรรทัดที่มี comment ของ bot อยู่แล้ว (comment เก่าไม่ถูกลบ)
 - 1 รันต่อ PR: push ใหม่ระหว่างรีวิวจะยกเลิกรันเก่า (cancel-in-progress) commit ของรันที่ถูกยกเลิกจะถูกรวมในรันถัดไป เพราะ checkpoint ยังเป็นของรอบที่จบล่าสุด
-- draft: push เข้า draft ไม่รีวิว (`OCR_REVIEW_DRAFTS=false`) จนกว่าจะติด label หรือสั่ง Run workflow
+- draft: push เข้า draft ไม่รีวิว (`OCR_REVIEW_DRAFTS=false`) จนกว่าจะติด label
 - Actions › OCR Review › Run workflow: ใส่ `pr_number` (ติ๊ก `full_review` = รีวิวทั้ง PR ใหม่โดยไม่สน checkpoint, override model/protocol/thinking ได้)
 - Mapping model/protocol/thinking:
 
@@ -64,7 +67,7 @@ PR-Agent ถูกถอดออกแล้ว (`pr-agent.yml`, `.pr_agent.tom
 - Header: OCR ส่ง `User-Agent: open-code-review/1.13.3` เอง และ workflow ส่ง `x-opencode-session` ให้ Go ทำ prompt cache
 
 ## เงื่อนไขของ OpenCode summary
-- รันเมื่อ opened / reopened / ready_for_review / synchronize (push), `edited` (เฉพาะตอนแก้ body), ติด label `ai-review` และ workflow_dispatch(pr_number)
+- รันเมื่อ opened / reopened / ready_for_review / synchronize (push), `edited` (เฉพาะตอนแก้ body) และติด label `ai-review`
 - draft: สรุปเฉพาะเมื่อติด label `ai-review` อยู่ (ถือว่าเข้า Review แล้ว) push WIP เข้า draft ที่ไม่มี label ข้ามระดับ job 0 นาที
 - ข้ามระดับ job (0 นาที): PR ที่ไม่มีไฟล์เปลี่ยน (`changed_files = 0` เช่น empty first commit), head branch ที่อยู่ใน skip list, label อื่น
 - ขั้นแรก "Check description" ดู PR สด ๆ: ตัด HTML comment, heading (`#`), checklist (`- [ ]`/`- [x]`) และ bullet ว่างออก แล้วนับตัวอักษรที่ไม่ใช่ช่องว่าง ถ้า **≥ 30** ถือว่ามี description ข้าม (เสีย 1 นาที slim)
@@ -99,13 +102,12 @@ PR-Agent ถูกถอดออกแล้ว (`pr-agent.yml`, `.pr_agent.tom
 | ติด label `ai-review` (draft หรือไม่ก็ได้) | รีวิว: ครั้งแรกทั้ง PR, ครั้งต่อไปเฉพาะ commit ใหม่ | body ว่าง: ยังไม่มี summary = สรุปทั้ง PR, มีแล้ว = comment อัปเดตสำหรับ commit ที่ยังไม่สรุป |
 | เอา label ออกแล้วติดใหม่ ไม่มี commit ใหม่ | no-op (~12 วินาที) | ข้าม (สรุปถึง head แล้ว) |
 | ready_for_review ไม่เคยติด label | รีวิวทั้ง PR | body ว่าง → สรุปทั้ง PR |
-| ready_for_review หลังรีวิวด้วย label แล้ว | ส่งต่อเป็น workflow_dispatch → เฉพาะ commit หลังรอบ label (ไม่มี = no-op) | สรุปถึง head แล้ว = ข้าม, ไม่งั้น comment อัปเดต |
+| ready_for_review หลังรีวิวด้วย label แล้ว | รีวิวทั้ง PR อีกรอบ (OCR บังคับ; inline ซ้ำบรรทัดเดิมไม่โพสต์ซ้ำ) | สรุปถึง head แล้ว = ข้าม, ไม่งั้น comment อัปเดต |
 | reopened | รีวิวทั้ง PR (OCR บังคับ) | body ว่าง + head ใหม่ → comment อัปเดต, ไม่งั้นข้าม |
 | แก้ body (edited) | ไม่รัน | ลบ description ทิ้งจนว่าง → สรุป/อัปเดต, เขียน description → ข้าม (comment หยุดอัปเดต) |
-| workflow_dispatch(pr_number) | รีวิว (checkpoint; ติ๊ก `full_review` = ทั้ง PR) draft ก็ได้ | สรุป/อัปเดตตามกฎเดียวกัน draft ก็ได้ |
-| PR sync/release (head `main`/`develop`/`release/*`) | ข้าม 0 นาที (ยกเว้นสั่งด้วย label/dispatch) | ข้าม 0 นาที (ยกเว้น label/dispatch) |
-| PR ของ bot (Dependabot, agent) | รีวิวเหมือน PR คน (Dependabot ต้องมี Dependabot secret ไม่งั้น fail ที่ Check secret) | เหมือน PR คน (ไม่มี key → ข้าม) |
-| PR จาก fork | fail ที่ Check secret (fork ไม่ได้ secret) | ข้าม (ไม่มี key) |
+| PR sync/release (head `main`/`develop`/`release/*`) | ข้าม 0 นาที (ยกเว้นสั่งด้วย label) | ข้าม 0 นาที (ยกเว้น label) |
+| PR ของ bot (Dependabot, agent) | รีวิวเหมือน PR คน (ใช้ OIDC token ได้ถ้าตั้ง `OPENCODE_CLIENT_ID`; แบบ secret ต้องมี Dependabot secret ไม่งั้น fail ที่ Sign in to OpenCode) | เหมือน PR คน (ไม่มี key → ข้าม) |
+| PR จาก fork | fail ที่ Sign in to OpenCode (fork ไม่ได้ OIDC token และ secret) | ข้าม (ไม่มี credential) |
 | diff ว่าง (มีแต่ empty commit, ไม่ใช่ draft) | รันแต่ไม่มีอะไรให้รีวิว (ยังไม่ได้ทดสอบกรณีนี้; ใน flow ClickUp เป็น draft จึงข้าม) | ข้าม 0 นาที |
 | label อื่นที่ไม่ใช่ `ai-review` | ข้าม 0 นาที | ข้าม 0 นาที |
 
@@ -122,10 +124,10 @@ PR-Agent ถูกถอดออกแล้ว (`pr-agent.yml`, `.pr_agent.tom
 |---|---|---|
 | ClickUp เปิด **draft** PR (empty first commit, body ว่าง) | ข้าม 0 นาที | ข้าม 0 นาที |
 | dev push WIP เข้า draft | ข้าม 0 นาที | ข้าม 0 นาที |
-| task ย้ายไป **Review** → bot ติด label `ai-review` (หรือเรียก workflow_dispatch) | รีวิวทั้ง PR | body ว่าง → สรุปทั้ง PR |
+| task ย้ายไป **Review** → bot ติด label `ai-review` | รีวิวทั้ง PR | body ว่าง → สรุปทั้ง PR |
 | แก้ตาม review (push, ยังเป็น draft) | ข้าม | comment "อัปเดต PR" ใหม่ |
 | ย้ายกลับ Review → bot เอา label ออกแล้วติดใหม่ | รีวิวเฉพาะ commit ใหม่ | สรุปถึง head แล้ว → ข้าม |
-| QA ผ่าน → `gh pr ready` | เฉพาะ commit ที่ยังไม่รีวิว (ไม่มี = no-op) | สรุปถึง head แล้ว → ข้าม |
+| QA ผ่าน → `gh pr ready` | รีวิวทั้ง PR อีกรอบ (inline ซ้ำไม่โพสต์ซ้ำ) | สรุปถึง head แล้ว → ข้าม |
 | push แก้หลัง ready | รีวิวเฉพาะ commit ใหม่ | comment "อัปเดต PR" ใหม่ |
 | PR sync/release (`develop`→`main`, `release/*`) | ข้าม | ข้าม |
 
@@ -141,7 +143,7 @@ PR-Agent ถูกถอดออกแล้ว (`pr-agent.yml`, `.pr_agent.tom
 | OpenCode สรุป PR ที่ไม่มี description (ทั้ง PR) | ubuntu-slim | 0:33–0:54 | 1 | $0.002 |
 | OpenCode comment อัปเดต (1–2 commit) | ubuntu-slim | 0:31–0:36 | 1 | $0.002 |
 | OCR หลัง force-push (checkpoint หาไม่เจอ → ทั้ง PR) | ubuntu-latest | 2:32 | 3 | $0.018 |
-| ready หลัง label: `ready-handoff` + dispatch checkpoint (1 commit) | slim + latest | 0:05 + 1:22 | 1 + 2 | $0.014 |
+| ready หลัง label (รีวิวทั้ง PR อีกรอบ) | ubuntu-latest | ~2:05–2:35 | 3 | $0.018 |
 | OpenCode เจอ description / สรุปถึง head แล้ว → ข้าม | ubuntu-slim | 0:05–0:07 | 1 | $0.002 |
 | draft / empty commit / sync PR → ข้ามระดับ job | – | 0 | 0 | $0 |
 

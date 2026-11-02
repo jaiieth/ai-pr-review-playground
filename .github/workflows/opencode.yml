@@ -19,11 +19,10 @@ name: OpenCode PR Summary
 #       OPENCODE_SUMMARY_DRAFTS == 'true' (WIP pushes to unlabeled drafts cost 0 minutes)
 #   edited                       -> only when the body changed
 #   labeled with OCR_TRIGGER_LABEL (ai-review) -> drafts too (same label that triggers OCR)
-#   workflow_dispatch(pr_number) -> drafts too
 # Skips that need no API call (draft, empty diff, other labels, skip-list head branch) cost 0 minutes.
-# Credential: repo var OPENCODE_CLIENT_ID (service-account token via GitHub OIDC) and/or secret
-# OPENCODE_GO_API_KEY (fallback); same 'Sign in to OpenCode' step as ocr-review.yml. Optional repo variables:
-#   OPENCODE_AUTH_MODE        default auto  (auto | token | secret; shared with ocr-review.yml)
+# Credential: repo var OPENCODE_CLIENT_ID (service-account token via GitHub OIDC, pull_request events
+# only), else secret OPENCODE_GO_API_KEY; same 'Sign in to OpenCode' step as ocr-review.yml.
+# Only pull_request events (no workflow_dispatch). Optional repo variables:
 #   OPENCODE_MODEL            default opencode-go/deepseek-v4.1-flash
 #   OPENCODE_SUMMARY_MIN_CHARS default 30  (non-space characters left after removing HTML comments,
 #                                           headings, checklist items and empty bullets)
@@ -35,19 +34,12 @@ name: OpenCode PR Summary
 on:
   pull_request:
     types: [opened, reopened, ready_for_review, edited, synchronize, labeled]
-  workflow_dispatch:
-    inputs:
-      pr_number:
-        description: PR number to summarize (drafts included; still skipped if it has a description)
-        required: true
-        type: string
 
 permissions: {}
 
 jobs:
   summary:
     if: >
-      github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' && github.event.pull_request.changed_files > 0 &&
        ((github.event.action == 'labeled' &&
          github.event.label.name == (vars.OCR_TRIGGER_LABEL || 'ai-review')) ||
@@ -61,7 +53,7 @@ jobs:
     runs-on: ubuntu-slim
     timeout-minutes: 12
     concurrency:
-      group: opencode-summary-${{ github.event.pull_request.number || inputs.pr_number }}
+      group: opencode-summary-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     permissions:
       contents: read
@@ -77,11 +69,11 @@ jobs:
         id: gate
         env:
           MIN_CHARS: ${{ vars.OPENCODE_SUMMARY_MIN_CHARS || '30' }}
-          HAS_KEY: ${{ vars.OPENCODE_AUTH_MODE != 'token' && secrets.OPENCODE_GO_API_KEY != '' }}   # boolean only, never the value
-          CAN_TOKEN: ${{ vars.OPENCODE_AUTH_MODE != 'secret' && vars.OPENCODE_CLIENT_ID != '' }}   # + OIDC available (checked below)
+          HAS_KEY: ${{ secrets.OPENCODE_GO_API_KEY != '' }}   # boolean only, never the value
+          CAN_TOKEN: ${{ vars.OPENCODE_CLIENT_ID != '' }}   # + OIDC available (checked below)
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           EVENT_BEFORE: ${{ github.event.before }}   # synchronize only
         shell: python3 {0}
         run: |
@@ -131,8 +123,8 @@ jobs:
               reason = 'PR has a description'
           elif pr['changed_files'] == 0:
               reason = 'empty diff (e.g. only an empty first commit)'
-          elif os.environ['HAS_KEY'] != 'true' and not (
-                  os.environ['CAN_TOKEN'] == 'true' and os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL')):
+          elif not (os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL') if os.environ['CAN_TOKEN'] == 'true'
+                    else os.environ['HAS_KEY'] == 'true'):
               reason = ('no OpenCode credential: no OPENCODE_GO_API_KEY and no OIDC sign-in '
                         '(fork PR, or Dependabot without a Dependabot secret)')
           else:
@@ -163,7 +155,7 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/pull/${{ github.event.pull_request.number || inputs.pr_number }}/head
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
           fetch-depth: 0
           persist-credentials: false
 
@@ -188,7 +180,7 @@ jobs:
           BASE_SHA: ${{ steps.gate.outputs.base_sha }}
           MODE: ${{ steps.gate.outputs.mode }}
           FROM_SHA: ${{ steps.gate.outputs.from_sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           MAX_DIFF_BYTES: "400000"
         run: |
           PR_TITLE="$(cat "$RUNNER_TEMP/pr-title.txt")"
@@ -258,54 +250,45 @@ jobs:
 
       - name: Sign in to OpenCode
         if: steps.gate.outputs.run == 'true' && steps.prep.outputs.mode != 'marker'
-        # OPENCODE_AUTH_MODE (repo var): auto (default) | token | secret
-        #   auto:   service-account token via GitHub OIDC when vars.OPENCODE_CLIENT_ID is set and the
-        #           exchange succeeds, otherwise secrets.OPENCODE_GO_API_KEY
-        #   token:  token only (the secret is never read); secret: key only (no exchange)
-        # The credential is exported as env OPENCODE_API_KEY for the later steps of this job.
+        # vars.OPENCODE_CLIENT_ID set -> OpenCode service-account token via GitHub OIDC (1 hour; the
+        # console credential trusts pull_request workflows of this repo; fork PRs get no OIDC token).
+        # Not set -> secrets.OPENCODE_GO_API_KEY. Exported as env OPENCODE_API_KEY for later steps.
         id: auth
         env:
           CLIENT_ID: ${{ vars.OPENCODE_CLIENT_ID }}
-          AUTH_MODE: ${{ vars.OPENCODE_AUTH_MODE || 'auto' }}
-          FALLBACK_KEY: ${{ vars.OPENCODE_AUTH_MODE != 'token' && secrets.OPENCODE_GO_API_KEY || '' }}
+          KEY: ${{ vars.OPENCODE_CLIENT_ID == '' && secrets.OPENCODE_GO_API_KEY || '' }}
         run: |
           set -uo pipefail
-          # Never prints the OIDC token, the OpenCode token or the key (all masked before use).
-          case "$AUTH_MODE" in auto|token|secret) ;; *) echo "::error::OPENCODE_AUTH_MODE must be auto, token or secret (got '$AUTH_MODE')"; exit 1 ;; esac
-          token='' mode=none
-          if [ "$AUTH_MODE" != secret ] && [ -n "$CLIENT_ID" ]; then
+          # Never prints the OIDC token, the OpenCode token or the key (masked before use).
+          if [ -n "$CLIENT_ID" ]; then
             if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-              echo "::notice::No GitHub OIDC token in this run (fork PR, or the job lacks id-token: write)"
-            else
-              # Same calls as the OpenCode console snippet (credential trust: see OCR-SETUP.md).
-              oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-                "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://opencode.ai/console" | jq -r '.value // empty') || oidc=''
-              [ -n "$oidc" ] && echo "::add-mask::$oidc"
-              resp=$(mktemp)
-              status=$(curl -sS -o "$resp" -w '%{http_code}' -X POST https://opencode.ai/console/auth/oauth/token \
-                -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
-                -d "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
-                -d "client_id=$CLIENT_ID" \
-                -d "subject_token=$oidc") || status=000
-              token=$(jq -r '.access_token // empty' "$resp" 2>/dev/null) || token=''
-              if [ -n "$token" ]; then
-                echo "::add-mask::$token"
-                mode=token
-                echo "OpenCode sign-in: service-account token (HTTP $status, expires in $(jq -r '.expires_in // "?"' "$resp")s)"
-              else
-                echo "::warning::OpenCode token exchange failed for event ${GITHUB_EVENT_NAME} (HTTP $status): $(jq -c '{error, error_description}' "$resp" 2>/dev/null || echo 'non-JSON response'). The console credential may not trust this event."
-              fi
-              rm -f "$resp"
+              echo "::error::No GitHub OIDC token in this run (fork PR, or the job lacks id-token: write)"
+              exit 1
             fi
-          fi
-          if [ -z "$token" ] && [ -n "$FALLBACK_KEY" ]; then
-            token=$FALLBACK_KEY
-            mode=secret
+            # Same calls as the OpenCode console snippet.
+            oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://opencode.ai/console" | jq -r '.value // empty') || oidc=''
+            [ -n "$oidc" ] && echo "::add-mask::$oidc"
+            resp=$(mktemp)
+            status=$(curl -sS -o "$resp" -w '%{http_code}' -X POST https://opencode.ai/console/auth/oauth/token \
+              -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+              -d "subject_token_type=urn:ietf:params:oauth:token-type:jwt" \
+              -d "client_id=$CLIENT_ID" \
+              -d "subject_token=$oidc") || status=000
+            token=$(jq -r '.access_token // empty' "$resp" 2>/dev/null) || token=''
+            if [ -z "$token" ]; then
+              echo "::error::OpenCode token exchange failed (HTTP $status): $(jq -c '{error, error_description}' "$resp" 2>/dev/null || echo 'non-JSON response'). Check the OPENCODE_CLIENT_ID credential in the OpenCode console (it must trust pull_request workflows of ${GITHUB_REPOSITORY})."
+              rm -f "$resp"
+              exit 1
+            fi
+            echo "::add-mask::$token"
+            echo "OpenCode sign-in: service-account token (HTTP $status, expires in $(jq -r '.expires_in // "?"' "$resp")s)"
+            rm -f "$resp"
+          elif [ -n "$KEY" ]; then
+            token=$KEY
             echo "OpenCode sign-in: secrets.OPENCODE_GO_API_KEY"
-          fi
-          echo "mode=$mode" >> "$GITHUB_OUTPUT"
-          if [ -z "$token" ]; then
-            echo "::error::No OpenCode credential for this run (auth mode $AUTH_MODE). Token: needs vars.OPENCODE_CLIENT_ID, id-token: write and an event the console credential trusts (fork PRs get no OIDC token). Key: secrets.OPENCODE_GO_API_KEY (fork PRs never get secrets; Dependabot PRs read Dependabot secrets)."
+          else
+            echo "::error::No OpenCode credential: set repo var OPENCODE_CLIENT_ID (service account) or secret OPENCODE_GO_API_KEY. Fork PRs never get secrets; Dependabot PRs read Dependabot secrets."
             exit 1
           fi
           echo "OPENCODE_API_KEY=$token" >> "$GITHUB_ENV"
@@ -330,7 +313,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ steps.gate.outputs.base_sha }}
           HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
           FROM_SHA: ${{ steps.gate.outputs.from_sha }}
